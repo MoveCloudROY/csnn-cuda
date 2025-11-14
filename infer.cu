@@ -1,0 +1,946 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <chrono>
+#include <iomanip>
+#include <numeric>
+#include <algorithm>
+// Permitted CUDA headers for custom kernels
+#include <cstring>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+#include <cuda_fp16.h>
+#include <cooperative_groups.h>
+#include <mma.h>
+
+// ===================================================================================
+// Helper for CUDA Error Handling - DO NOT MODIFY BEGIN
+// ===================================================================================
+#define checkCudaErrors(val) check((val), #val, __FILE__, __LINE__)
+void check(cudaError_t err, const char* const func, const char* const file, const int line) {
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA error at " << file << ":" << line << std::endl;
+        std::cerr << cudaGetErrorString(err) << " " << func << std::endl;
+        exit(1);
+    }
+}
+// ===================================================================================
+// Helper for CUDA Error Handling - DO NOT MODIFY END
+// ===================================================================================
+
+// ===================================================================================
+// Data and Parameter Loading Functions - DO NOT MODIFY BEGIN
+// ===================================================================================
+std::vector<std::vector<float>> read_mnist_images(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        std::cerr << "Cannot open file: " << path << std::endl;
+        return {};
+    }
+    int magic_number = 0, num_images = 0, num_rows = 0, num_cols = 0;
+    file.read((char*)&magic_number, 4);
+    magic_number = __builtin_bswap32(magic_number);
+    file.read((char*)&num_images, 4);
+    num_images = __builtin_bswap32(num_images);
+    file.read((char*)&num_rows, 4);
+    num_rows = __builtin_bswap32(num_rows);
+    file.read((char*)&num_cols, 4);
+    num_cols = __builtin_bswap32(num_cols);
+    std::vector<std::vector<float>> images(num_images, std::vector<float>(num_rows * num_cols));
+    std::vector<unsigned char>      buffer(num_rows * num_cols);
+    for (int i = 0; i < num_images; ++i) {
+        file.read((char*)buffer.data(), buffer.size());
+        for (size_t j = 0; j < buffer.size(); ++j) {
+            images[i][j] = (static_cast<float>(buffer[j]) / 255.0f - 0.5f) / 0.5f; // Normalization
+        }
+    }
+    return images;
+}
+
+std::vector<int> read_mnist_labels(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        std::cerr << "Cannot open file: " << path << std::endl;
+        return {};
+    }
+    int magic_number = 0, num_items = 0;
+    file.read((char*)&magic_number, 4);
+    magic_number = __builtin_bswap32(magic_number);
+    file.read((char*)&num_items, 4);
+    num_items = __builtin_bswap32(num_items);
+    std::vector<int>           labels(num_items);
+    std::vector<unsigned char> buffer(num_items);
+    file.read((char*)buffer.data(), num_items);
+    for (int i = 0; i < num_items; ++i) {
+        labels[i] = static_cast<int>(buffer[i]);
+    }
+    return labels;
+}
+
+std::vector<float> read_param(const std::string& path) {
+    std::ifstream file(path);
+    if (!file) {
+        std::cerr << "Cannot open parameter file: " << path << std::endl;
+        return {};
+    }
+    std::vector<float> params;
+    float              param;
+    while (file >> param) {
+        params.push_back(param);
+    }
+    return params;
+}
+
+// ===================================================================================
+// Data and Parameter Loading Functions - DO NOT MODIFY END
+// ===================================================================================
+// clang-format off
+#define BATCH_SIZE          1000
+#define NEURON_T            2
+// clang-format on
+
+// ===================================================================================
+// CUDA kernels and helpers for SCNN inference
+// ===================================================================================
+
+static inline int div_up(int a, int b) {
+    return (a + b - 1) / b;
+}
+
+static void dump_host_f32(const char* path, const float* h, size_t n) {
+    FILE* f = fopen(path, "wb");
+    if (!f)
+        return;
+    fwrite(h, sizeof(float), n, f);
+    fclose(f);
+}
+
+template <int K>
+__global__ void conv2d_nchw_kernel(
+    const float* __restrict__ x, // [N, Ci, Hi, Wi]
+    const float* __restrict__ w, // [Co, Ci, K, K]
+    const float* __restrict__ b, // [Co]
+    float* __restrict__ y,       // [N, Co, Ho, Wo]
+    int N, int Ci, int Hi, int Wi, int Co
+) {
+    // Grid mapping: (x,y) tile output spatial; z = N*Co, each block handles (n, oc)
+    const int Ho = Hi - K + 1;
+    const int Wo = Wi - K + 1;
+
+    const int oc = blockIdx.z % Co;
+    const int n  = blockIdx.z / Co;
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int ow = blockIdx.x * blockDim.x + tx;
+    const int oh = blockIdx.y * blockDim.y + ty;
+
+    if (n >= N || oc >= Co || oh >= Ho || ow >= Wo)
+        return;
+
+    float acc = __ldg(b + oc);
+
+    // For each input channel and kernel element
+    for (int ci = 0; ci < Ci; ++ci) {
+        const int x_base = ((n * Ci + ci) * Hi + oh) * Wi + ow;
+        const int w_base = ((oc * Ci + ci) * K) * K;
+#pragma unroll
+        for (int ky = 0; ky < K; ++ky) {
+#pragma unroll
+            for (int kx = 0; kx < K; ++kx) {
+                float xv = __ldg(x + x_base + ky * Wi + kx);
+                float ww = __ldg(w + w_base + ky * K + kx);
+                acc      = fmaf(xv, ww, acc);
+            }
+        }
+    }
+
+    const int y_idx = ((n * Co + oc) * Ho + oh) * Wo + ow;
+    y[y_idx]        = acc;
+}
+
+// Alternative conv kernel mapping grid.z = N only, iterate oc inside thread
+template <int K>
+__global__ void conv2d_nchw_kernel_n_only(
+    const float* __restrict__ x, // [N, Ci, Hi, Wi]
+    const float* __restrict__ w, // [Co, Ci, K, K]
+    const float* __restrict__ b, // [Co]
+    float* __restrict__ y,       // [N, Co, Ho, Wo]
+    int N, int Ci, int Hi, int Wi, int Co
+) {
+    // Grid mapping: (x,y) tile output spatial for Ho x Wo; z = N only
+    // Each thread computes all output channels at its (oh, ow)
+    const int Ho = Hi - K + 1;
+    const int Wo = Wi - K + 1;
+
+    const int n  = blockIdx.z;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int ow = blockIdx.x * blockDim.x + tx;
+    const int oh = blockIdx.y * blockDim.y + ty;
+
+    if (n >= N || oh >= Ho || ow >= Wo)
+        return;
+
+    // Accumulate per output channel
+    for (int oc = 0; oc < Co; ++oc) {
+        float acc = __ldg(b + oc);
+        for (int ci = 0; ci < Ci; ++ci) {
+            const int x_base = ((n * Ci + ci) * Hi + oh) * Wi + ow;
+            const int w_base = ((oc * Ci + ci) * K) * K;
+#pragma unroll
+            for (int ky = 0; ky < K; ++ky) {
+#pragma unroll
+                for (int kx = 0; kx < K; ++kx) {
+                    float xv = __ldg(x + x_base + ky * Wi + kx);
+                    float ww = __ldg(w + w_base + ky * K + kx);
+                    acc      = fmaf(xv, ww, acc);
+                }
+            }
+        }
+        const int y_idx = ((n * Co + oc) * Ho + oh) * Wo + ow;
+        y[y_idx]        = acc;
+    }
+}
+
+__global__ void
+ifnode_threshold_kernel(const float* __restrict__ x, float* __restrict__ y, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total)
+        return;
+    float v = x[i];
+    y[i]    = (v >= 1.0f) ? 1.0f : 0.0f;
+}
+
+// Specialized conv for Cin=1, K=5 with shared memory tiling
+__global__ void conv2d_c1_k5_kernel(
+    const float* __restrict__ x, // [N, 1, 28, 28]
+    const float* __restrict__ w, // [Co, 1, 5, 5] flattened (C order)
+    const float* __restrict__ b, // [Co]
+    float* __restrict__ y,       // [N, Co, 24, 24]
+    int N, int Co
+) {
+    constexpr int K  = 5;
+    const int     Hi = 28;
+    const int     Wi = 28;
+    const int     Ho = Hi - K + 1; // 24
+    const int     Wo = Wi - K + 1; // 24
+
+    extern __shared__ float tile[]; // size: (blockDim.y+K-1)*(blockDim.x+K-1)
+    const int               tileW = blockDim.x + K - 1;
+    const int               tileH = blockDim.y + K - 1;
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int ow = blockIdx.x * blockDim.x + tx;
+    const int oh = blockIdx.y * blockDim.y + ty;
+
+    const int z  = blockIdx.z; // z = n * Co + oc
+    const int oc = z % Co;
+    const int n  = z / Co;
+    if (n >= N)
+        return;
+
+    // Load input tile for this (n) and spatial tile; Cin=1
+    const int ow0 = blockIdx.x * blockDim.x;
+    const int oh0 = blockIdx.y * blockDim.y;
+
+    for (int yy = ty; yy < tileH; yy += blockDim.y) {
+        int ih = oh0 + yy;
+        for (int xx = tx; xx < tileW; xx += blockDim.x) {
+            int   iw = ow0 + xx;
+            float v  = 0.0f;
+            if (ih >= 0 && ih < Hi && iw >= 0 && iw < Wi) {
+                const int x_idx = ((n * 1 + 0) * Hi + ih) * Wi + iw;
+                v               = __ldg(x + x_idx);
+            }
+            tile[yy * tileW + xx] = v;
+        }
+    }
+    __syncthreads();
+
+    if (oh < Ho && ow < Wo) {
+        const float* w_oc = w + oc * (K * K);
+        float        acc  = __ldg(b + oc);
+#pragma unroll
+        for (int ky = 0; ky < K; ++ky) {
+#pragma unroll
+            for (int kx = 0; kx < K; ++kx) {
+                float xv = tile[(ty + ky) * tileW + (tx + kx)];
+                float ww = __ldg(w_oc + ky * K + kx);
+                acc      = fmaf(xv, ww, acc);
+            }
+        }
+        const int y_idx = ((n * Co + oc) * Ho + oh) * Wo + ow;
+        y[y_idx]        = acc;
+    }
+}
+
+// Integrate-and-Fire: mem += x; spk = (mem >= thr); hard reset mem=0 when spiking
+__global__ void ifnode_integrate_fire_kernel(
+    const float* __restrict__ x, float* __restrict__ mem, float* __restrict__ spk, float thr,
+    int total
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total)
+        return;
+    float v = mem[i] + x[i];
+    // spike when membrane crosses threshold; hard reset to 0
+    float s = v >= thr ? 1.0f : 0.0f;
+    spk[i]  = s;
+    // Reset membrane to zero on spike, keep otherwise
+    mem[i] = (s > 0.0f) ? 0.0f : v;
+}
+
+__global__ void maxpool2x2_s2_nchw_kernel(
+    const float* __restrict__ x, // [N, C, Hi, Wi]
+    float* __restrict__ y,       // [N, C, Ho, Wo]
+    int N, int C, int Hi, int Wi
+) {
+    const int Ho = Hi / 2;
+    const int Wo = Wi / 2;
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int ow = blockIdx.x * blockDim.x + tx;
+    const int oh = blockIdx.y * blockDim.y + ty;
+    const int z  = blockIdx.z; // n*c plane
+    const int n  = z / C;
+    const int c  = z % C;
+
+    if (n >= N || c >= C || oh >= Ho || ow >= Wo)
+        return;
+
+    const int ih0    = oh * 2;
+    const int iw0    = ow * 2;
+    const int x_base = ((n * C + c) * Hi + ih0) * Wi + iw0;
+
+    float v00 = __ldg(x + x_base);
+    float v01 = (iw0 + 1 < Wi) ? __ldg(x + x_base + 1) : v00;
+    float v10 = (ih0 + 1 < Hi) ? __ldg(x + x_base + Wi) : v00;
+    float v11 = (ih0 + 1 < Hi && iw0 + 1 < Wi) ? __ldg(x + x_base + Wi + 1) : v00;
+
+    float m0 = fmaxf(v00, v01);
+    float m1 = fmaxf(v10, v11);
+    float mv = fmaxf(m0, m1);
+
+    const int y_idx = ((n * C + c) * Ho + oh) * Wo + ow;
+    y[y_idx]        = mv;
+}
+
+// Fully-connected forward: y = W x + b, W: [Out, In], x: [N, In], y: [N, Out]
+__global__ void fc_forward_kernel(
+    const float* __restrict__ x, // [N, In]
+    const float* __restrict__ W, // [Out, In]
+    const float* __restrict__ b, // [Out]
+    float* __restrict__ y,       // [N, Out]
+    int N, int In, int Out
+) {
+    extern __shared__ float xs[]; // size In
+    const int               n = blockIdx.y;
+    if (n >= N)
+        return;
+
+    // Stage x[n] into shared memory
+    for (int i = threadIdx.x; i < In; i += blockDim.x) {
+        xs[i] = __ldg(x + n * In + i);
+    }
+    __syncthreads();
+
+    const int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (out_idx >= Out)
+        return;
+
+    const float* w_row = W + out_idx * In;
+    float        acc   = __ldg(b + out_idx);
+
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        // Unroll up to 32 if small; handle generic In in loop below
+    }
+    // Compute dot
+    for (int i = 0; i < In; ++i) {
+        acc = fmaf(xs[i], __ldg(w_row + i), acc);
+    }
+
+    y[n * Out + out_idx] = acc;
+}
+
+__global__ void add_inplace_kernel(float* __restrict__ a, const float* __restrict__ b, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    a[i] += b[i];
+}
+
+__global__ void scale_inplace_kernel(float* __restrict__ a, float s, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    a[i] *= s;
+}
+
+__global__ void argmax10_kernel(const float* __restrict__ logits, int* __restrict__ preds, int N) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N)
+        return;
+    const float* row    = logits + n * 10;
+    int          best_k = 0;
+    float        best_v = row[0];
+    for (int k = 1; k < 10; ++k) {
+        float v = row[k];
+        if (v > best_v) {
+            best_v = v;
+            best_k = k;
+        }
+    }
+    preds[n] = best_k;
+}
+
+/*
+
+model: 
+
+class SCNN(nn.Module):
+    def __init__(self, T: int):
+        super(SCNN, self).__init__()
+        self.T = 2
+        # 1x28x28
+        self.conv1 = layer.Conv2d(1, 8, 5) # in_channels: 1, out_channels: 6, kernel_size: 5
+        # 6x24x24
+        self.if1 = neuron.IFNode()
+        self.pool1 = layer.MaxPool2d(2, 2)
+        # 6x12x12
+
+        self.conv2 = layer.Conv2d(8, 16, 5) # in_channels: 6, out_channels: 16, kernel_size: 5
+        # 16x8x8
+        self.if2 = neuron.IFNode()
+        self.pool2 = layer.MaxPool2d(2, 2)
+        # 16x4x4
+
+        self.flatten = layer.Flatten()
+        
+        self.fc1 = layer.Linear(16 * 4 * 4, 128)
+        # 120
+        self.if3 = neuron.IFNode()
+
+        self.fc2 = layer.Linear(128, 96)
+        # 84
+        self.if4 = neuron.IFNode()
+
+        self.fc3 = layer.Linear(96, 10)
+        # 10
+
+
+    def forward(self, x: torch.Tensor):
+        outputs = []
+        for t in range(self.T):
+            y = self.conv1(x)
+            y = self.if1(y)
+            y = self.pool1(y)
+            y = self.conv2(y)
+            y = self.if2(y)
+            y = self.pool2(y)
+            y = self.flatten(y)
+            y = self.fc1(y)
+            y = self.if3(y)
+            y = self.fc2(y)
+            y = self.if4(y)
+            y = self.fc3(y)
+            outputs.append(y)
+        
+        outputs = torch.stack(outputs, dim=0)
+        return outputs.mean(0)
+
+*/
+
+
+std::vector<int> scnn_inference(
+    const std::vector<std::vector<float>>& images,
+    // Device pointers for parameters
+    float* d_conv1_w, float* d_conv1_b, float* d_conv2_w, float* d_conv2_b, float* d_fc1_w,
+    float* d_fc1_b, float* d_fc2_w, float* d_fc2_b, float* d_fc3_w, float* d_fc3_b
+    // YOU CAN ADD MORE PARAMETERS HERE!!!
+) {
+    std::vector<int> predictions;
+    const int        num_images = images.size(); // 1000
+    predictions.reserve(num_images);
+
+    // SNN-specific parameter, must match training
+    constexpr int TT = 2;
+
+    // Model fixed shapes from train_9004.py
+    const int C1_IN = 1, C1_OUT = 8, K = 5;
+    const int C2_IN = 8, C2_OUT = 16;
+    const int I_H = 28, I_W = 28;
+    const int C1_HO = I_H - K + 1;            // 24
+    const int C1_WO = I_W - K + 1;            // 24
+    const int P1_HO = C1_HO / 2;              // 12
+    const int P1_WO = C1_WO / 2;              // 12
+    const int C2_HO = P1_HO - K + 1;          // 8
+    const int C2_WO = P1_WO - K + 1;          // 8
+    const int P2_HO = C2_HO / 2;              // 4
+    const int P2_WO = C2_WO / 2;              // 4
+    const int FLAT  = C2_OUT * P2_HO * P2_WO; // 16*4*4=256
+    const int FC1_O = 128;
+    const int FC2_O = 96;
+    const int FC3_O = 10;
+
+    // Pre-allocate device buffers for the maximum batch size to reuse across batches
+    const int MAX_N = BATCH_SIZE;
+
+    float *d_input = nullptr, *d_conv1_out = nullptr, *d_if1_mem = nullptr, *d_if1_spk = nullptr;
+    float *d_pool1_out = nullptr, *d_conv2_out = nullptr, *d_if2_mem = nullptr,
+          *d_if2_spk   = nullptr;
+    float* d_pool2_out = nullptr;
+    // FC and logits buffers
+    float *d_fc1_out = nullptr, *d_if3_mem = nullptr, *d_if3_spk = nullptr;
+    float *d_fc2_out = nullptr, *d_if4_mem = nullptr, *d_if4_spk = nullptr;
+    float *d_fc3_out = nullptr, *d_logits_sum = nullptr;
+    int*   d_preds = nullptr;
+
+    // Allocate with maximum sizes
+    checkCudaErrors(cudaMalloc(&d_input, MAX_N * C1_IN * I_H * I_W * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_conv1_out, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if1_mem, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if1_spk, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_pool1_out, MAX_N * C1_OUT * P1_HO * P1_WO * sizeof(float)));
+
+    checkCudaErrors(cudaMalloc(&d_conv2_out, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if2_mem, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if2_spk, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_pool2_out, MAX_N * C2_OUT * P2_HO * P2_WO * sizeof(float)));
+
+    checkCudaErrors(cudaMalloc(&d_fc1_out, MAX_N * FC1_O * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if3_mem, MAX_N * FC1_O * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if3_spk, MAX_N * FC1_O * sizeof(float)));
+
+    checkCudaErrors(cudaMalloc(&d_fc2_out, MAX_N * FC2_O * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if4_mem, MAX_N * FC2_O * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if4_spk, MAX_N * FC2_O * sizeof(float)));
+
+    checkCudaErrors(cudaMalloc(&d_fc3_out, MAX_N * FC3_O * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_logits_sum, MAX_N * FC3_O * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_preds, MAX_N * sizeof(int)));
+
+    std::vector<int> batch_preds;
+    batch_preds.resize(MAX_N);
+
+    std::vector<float> h_batch; // host staging for input
+    h_batch.resize(MAX_N * C1_IN * I_H * I_W);
+
+    for (int offset = 0; offset < num_images; offset += MAX_N) {
+        int N = std::min(MAX_N, num_images - offset);
+
+        // Pack host batch into contiguous buffer
+        const int in_elems_per_img = C1_IN * I_H * I_W; // 784
+        for (int n = 0; n < N; ++n) {
+            const float* src = images[offset + n].data();
+            float*       dst = h_batch.data() + n * in_elems_per_img;
+            std::memcpy(dst, src, in_elems_per_img * sizeof(float));
+        }
+
+        // Copy inputs to device
+        checkCudaErrors(cudaMemcpy(
+            d_input,
+            h_batch.data(),
+            N * in_elems_per_img * sizeof(float),
+            cudaMemcpyHostToDevice
+        ));
+
+        // Zero IF memories and logits sum for this batch
+        checkCudaErrors(cudaMemset(d_if1_mem, 0, N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_if2_mem, 0, N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_if3_mem, 0, N * FC1_O * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_if4_mem, 0, N * FC2_O * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_logits_sum, 0, N * FC3_O * sizeof(float)));
+
+        // Common launch configs
+        const dim3 block2d(16, 16, 1);
+        // Conv1: (N*Co) in grid.z, K=5 shared mem tile size
+        const size_t conv1_smem = (block2d.x + K - 1) * (block2d.y + K - 1) * sizeof(float);
+        const dim3   grid_c1(div_up(C1_WO, block2d.x), div_up(C1_HO, block2d.y), N * C1_OUT);
+
+        // Pool kernels configs computed per layer
+        const dim3 grid_pool1(div_up(P1_WO, block2d.x), div_up(P1_HO, block2d.y), N * C1_OUT);
+        const dim3 grid_pool2(div_up(P2_WO, block2d.x), div_up(P2_HO, block2d.y), N * C2_OUT);
+
+        // IF launch config
+        const int threads1d = 256;
+
+        for (int t = 0; t < TT; ++t) {
+            // Conv1: Cin=1 fast path
+            conv2d_c1_k5_kernel<<<grid_c1, block2d, conv1_smem>>>(
+                d_input,
+                d_conv1_w,
+                d_conv1_b,
+                d_conv1_out,
+                N,
+                C1_OUT
+            );
+            checkCudaErrors(cudaGetLastError());
+
+            // IF after conv1
+            {
+                int total  = N * C1_OUT * C1_HO * C1_WO;
+                int blocks = div_up(total, threads1d);
+                ifnode_integrate_fire_kernel<<<blocks, threads1d>>>(
+                    d_conv1_out,
+                    d_if1_mem,
+                    d_if1_spk,
+                    1.0f,
+                    total
+                );
+                checkCudaErrors(cudaGetLastError());
+            }
+
+            // Pool1: 2x2 stride2
+            maxpool2x2_s2_nchw_kernel<<<grid_pool1, block2d>>>(
+                d_if1_spk,
+                d_pool1_out,
+                N,
+                C1_OUT,
+                C1_HO,
+                C1_WO
+            );
+            checkCudaErrors(cudaGetLastError());
+
+            // Conv2: general K=5, grid.z = N only
+            {
+                const dim3 grid_c2(div_up(C2_WO, block2d.x), div_up(C2_HO, block2d.y), N);
+                conv2d_nchw_kernel_n_only<5><<<grid_c2, block2d>>>(
+                    d_pool1_out,
+                    d_conv2_w,
+                    d_conv2_b,
+                    d_conv2_out,
+                    N,
+                    C2_IN,
+                    P1_HO,
+                    P1_WO,
+                    C2_OUT
+                );
+                checkCudaErrors(cudaGetLastError());
+            }
+
+            // IF after conv2
+            {
+                int total  = N * C2_OUT * C2_HO * C2_WO;
+                int blocks = div_up(total, threads1d);
+                ifnode_integrate_fire_kernel<<<blocks, threads1d>>>(
+                    d_conv2_out,
+                    d_if2_mem,
+                    d_if2_spk,
+                    1.0f,
+                    total
+                );
+                checkCudaErrors(cudaGetLastError());
+            }
+
+            // Pool2
+            maxpool2x2_s2_nchw_kernel<<<grid_pool2, block2d>>>(
+                d_if2_spk,
+                d_pool2_out,
+                N,
+                C2_OUT,
+                C2_HO,
+                C2_WO
+            );
+            checkCudaErrors(cudaGetLastError());
+
+            // Flatten is just reinterpretation: [N, 16, 4, 4] -> [N, 256]
+
+            // FC1
+            {
+                const int  In = FLAT, Out = FC1_O;
+                const dim3 block(256, 1, 1);
+                const dim3 grid(div_up(Out, 256), N, 1);
+                size_t     smem = In * sizeof(float);
+                fc_forward_kernel<<<grid, block, smem>>>(
+                    d_pool2_out,
+                    d_fc1_w,
+                    d_fc1_b,
+                    d_fc1_out,
+                    N,
+                    In,
+                    Out
+                );
+                checkCudaErrors(cudaGetLastError());
+            }
+
+            // IF3
+            {
+                int total  = N * FC1_O;
+                int blocks = div_up(total, threads1d);
+                ifnode_integrate_fire_kernel<<<blocks, threads1d>>>(
+                    d_fc1_out,
+                    d_if3_mem,
+                    d_if3_spk,
+                    1.0f,
+                    total
+                );
+                checkCudaErrors(cudaGetLastError());
+            }
+
+            // FC2
+            {
+                const int  In = FC1_O, Out = FC2_O;
+                const dim3 block(256, 1, 1);
+                const dim3 grid(div_up(Out, 256), N, 1);
+                size_t     smem = In * sizeof(float);
+                fc_forward_kernel<<<grid, block, smem>>>(
+                    d_if3_spk,
+                    d_fc2_w,
+                    d_fc2_b,
+                    d_fc2_out,
+                    N,
+                    In,
+                    Out
+                );
+                checkCudaErrors(cudaGetLastError());
+            }
+
+            // IF4
+            {
+                int total  = N * FC2_O;
+                int blocks = div_up(total, threads1d);
+                ifnode_integrate_fire_kernel<<<blocks, threads1d>>>(
+                    d_fc2_out,
+                    d_if4_mem,
+                    d_if4_spk,
+                    1.0f,
+                    total
+                );
+                checkCudaErrors(cudaGetLastError());
+            }
+
+            // FC3 (logits for this timestep)
+            {
+                const int  In = FC2_O, Out = FC3_O;
+                const dim3 block(256, 1, 1);
+                const dim3 grid(div_up(Out, 256), N, 1);
+                size_t     smem = In * sizeof(float);
+                fc_forward_kernel<<<grid, block, smem>>>(
+                    d_if4_spk,
+                    d_fc3_w,
+                    d_fc3_b,
+                    d_fc3_out,
+                    N,
+                    In,
+                    Out
+                );
+                checkCudaErrors(cudaGetLastError());
+            }
+
+            // Accumulate logits across time: logits_sum += d_fc3_out
+            {
+                int total  = N * FC3_O;
+                int blocks = div_up(total, threads1d);
+                add_inplace_kernel<<<blocks, threads1d>>>(d_logits_sum, d_fc3_out, total);
+                checkCudaErrors(cudaGetLastError());
+            }
+        }
+
+        // Average logits over T
+        {
+            int total  = N * FC3_O;
+            int blocks = div_up(total, threads1d);
+            scale_inplace_kernel<<<blocks, threads1d>>>(d_logits_sum, 1.0f / float(TT), total);
+            checkCudaErrors(cudaGetLastError());
+        }
+
+        // Argmax to predictions
+        {
+            const int threads = 256;
+            const int blocks  = div_up(N, threads);
+            argmax10_kernel<<<blocks, threads>>>(d_logits_sum, d_preds, N);
+            checkCudaErrors(cudaGetLastError());
+        }
+
+        // Copy predictions to host and append
+        checkCudaErrors(
+            cudaMemcpy(batch_preds.data(), d_preds, N * sizeof(int), cudaMemcpyDeviceToHost)
+        );
+        for (int n = 0; n < N; ++n) {
+            predictions.push_back(batch_preds[n]);
+        }
+    }
+
+    // Free batch buffers
+    checkCudaErrors(cudaFree(d_input));
+    checkCudaErrors(cudaFree(d_conv1_out));
+    checkCudaErrors(cudaFree(d_if1_mem));
+    checkCudaErrors(cudaFree(d_if1_spk));
+    checkCudaErrors(cudaFree(d_pool1_out));
+    checkCudaErrors(cudaFree(d_conv2_out));
+    checkCudaErrors(cudaFree(d_if2_mem));
+    checkCudaErrors(cudaFree(d_if2_spk));
+    checkCudaErrors(cudaFree(d_pool2_out));
+    checkCudaErrors(cudaFree(d_fc1_out));
+    checkCudaErrors(cudaFree(d_if3_mem));
+    checkCudaErrors(cudaFree(d_if3_spk));
+    checkCudaErrors(cudaFree(d_fc2_out));
+    checkCudaErrors(cudaFree(d_if4_mem));
+    checkCudaErrors(cudaFree(d_if4_spk));
+    checkCudaErrors(cudaFree(d_fc3_out));
+    checkCudaErrors(cudaFree(d_logits_sum));
+    checkCudaErrors(cudaFree(d_preds));
+
+    // Memory is freed in main for parameters.
+    return predictions;
+}
+
+// ===================================================================================
+// Main Function -  DO NOT MODIFY BEGIN
+// ===================================================================================
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <path_to_model_and_data_dir>" << std::endl;
+        return 1;
+    }
+    std::string dir = argv[1];
+
+    // Load test data
+    auto images = read_mnist_images(dir + "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
+    auto labels = read_mnist_labels(dir + "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
+    if (images.empty() || labels.empty())
+        return 1;
+
+    // Load model parameters to host memory
+    auto conv1_w = read_param(dir + "/model_90_04_fp32/conv1.weight.txt");
+    auto conv1_b = read_param(dir + "/model_90_04_fp32/conv1.bias.txt");
+    auto conv2_w = read_param(dir + "/model_90_04_fp32/conv2.weight.txt");
+    auto conv2_b = read_param(dir + "/model_90_04_fp32/conv2.bias.txt");
+    auto fc1_w   = read_param(dir + "/model_90_04_fp32/fc1.weight.txt");
+    auto fc1_b   = read_param(dir + "/model_90_04_fp32/fc1.bias.txt");
+    auto fc2_w   = read_param(dir + "/model_90_04_fp32/fc2.weight.txt");
+    auto fc2_b   = read_param(dir + "/model_90_04_fp32/fc2.bias.txt");
+    auto fc3_w   = read_param(dir + "/model_90_04_fp32/fc3.weight.txt");
+    auto fc3_b   = read_param(dir + "/model_90_04_fp32/fc3.bias.txt");
+
+    // --- 1. Allocate all necessary GPU memory ---
+    // Device pointers for parameters
+    float *d_conv1_w, *d_conv1_b, *d_conv2_w, *d_conv2_b;
+    float *d_fc1_w, *d_fc1_b, *d_fc2_w, *d_fc2_b, *d_fc3_w, *d_fc3_b;
+
+    // Allocate parameters
+    checkCudaErrors(cudaMalloc(&d_conv1_w, conv1_w.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_conv1_b, conv1_b.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_conv2_w, conv2_w.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_conv2_b, conv2_b.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc1_w, fc1_w.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc1_b, fc1_b.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc2_w, fc2_w.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc2_b, fc2_b.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc3_w, fc3_w.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc3_b, fc3_b.size() * sizeof(float)));
+
+    // --- 2. Copy constant parameters from host to device ---
+    checkCudaErrors(cudaMemcpy(
+        d_conv1_w,
+        conv1_w.data(),
+        conv1_w.size() * sizeof(float),
+        cudaMemcpyHostToDevice
+    ));
+    checkCudaErrors(cudaMemcpy(
+        d_conv1_b,
+        conv1_b.data(),
+        conv1_b.size() * sizeof(float),
+        cudaMemcpyHostToDevice
+    ));
+    checkCudaErrors(cudaMemcpy(
+        d_conv2_w,
+        conv2_w.data(),
+        conv2_w.size() * sizeof(float),
+        cudaMemcpyHostToDevice
+    ));
+    checkCudaErrors(cudaMemcpy(
+        d_conv2_b,
+        conv2_b.data(),
+        conv2_b.size() * sizeof(float),
+        cudaMemcpyHostToDevice
+    ));
+    checkCudaErrors(
+        cudaMemcpy(d_fc1_w, fc1_w.data(), fc1_w.size() * sizeof(float), cudaMemcpyHostToDevice)
+    );
+    checkCudaErrors(
+        cudaMemcpy(d_fc1_b, fc1_b.data(), fc1_b.size() * sizeof(float), cudaMemcpyHostToDevice)
+    );
+    checkCudaErrors(
+        cudaMemcpy(d_fc2_w, fc2_w.data(), fc2_w.size() * sizeof(float), cudaMemcpyHostToDevice)
+    );
+    checkCudaErrors(
+        cudaMemcpy(d_fc2_b, fc2_b.data(), fc2_b.size() * sizeof(float), cudaMemcpyHostToDevice)
+    );
+    checkCudaErrors(
+        cudaMemcpy(d_fc3_w, fc3_w.data(), fc3_w.size() * sizeof(float), cudaMemcpyHostToDevice)
+    );
+    checkCudaErrors(
+        cudaMemcpy(d_fc3_b, fc3_b.data(), fc3_b.size() * sizeof(float), cudaMemcpyHostToDevice)
+    );
+
+    // Start timer
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // ===================================================================================
+    // Main Function -  DO NOT MODIFY END
+    // ===================================================================================
+
+    // --- 3. Perform inference ---
+    // Pass device pointers to the inference function
+    std::vector<int> predictions = scnn_inference(
+        images,
+        d_conv1_w,
+        d_conv1_b,
+        d_conv2_w,
+        d_conv2_b,
+        d_fc1_w,
+        d_fc1_b,
+        d_fc2_w,
+        d_fc2_b,
+        d_fc3_w,
+        d_fc3_b
+        // YOU CAN ADD MORE PARAMETERS HERE!!!
+    );
+
+    // ===================================================================================
+    // Main Function -  DO NOT MODIFY BEGIN
+    // ===================================================================================
+
+    // Synchronize to ensure all GPU work is done before stopping the timer
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    // Stop timer
+    auto                          end  = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> diff = end - start;
+
+    // --- 4. Free all allocated GPU memory ---
+    checkCudaErrors(cudaFree(d_conv1_w));
+    checkCudaErrors(cudaFree(d_conv1_b));
+    checkCudaErrors(cudaFree(d_conv2_w));
+    checkCudaErrors(cudaFree(d_conv2_b));
+    checkCudaErrors(cudaFree(d_fc1_w));
+    checkCudaErrors(cudaFree(d_fc1_b));
+    checkCudaErrors(cudaFree(d_fc2_w));
+    checkCudaErrors(cudaFree(d_fc2_b));
+    checkCudaErrors(cudaFree(d_fc3_w));
+    checkCudaErrors(cudaFree(d_fc3_b));
+
+    // Calculate accuracy
+    int correct_predictions = 0;
+    for (size_t i = 0; i < labels.size(); ++i) {
+        if (predictions[i] == labels[i]) {
+            correct_predictions++;
+        }
+    }
+    double accuracy = static_cast<double>(correct_predictions) / labels.size();
+
+    // Output result in the required format
+    std::cout << std::fixed << std::setprecision(4) << diff.count() << ":" << accuracy << std::endl;
+
+    return 0;
+}
+// ===================================================================================
+// Main Function -  DO NOT MODIFY END
+// ===================================================================================

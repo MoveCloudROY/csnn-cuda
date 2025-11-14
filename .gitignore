@@ -1,0 +1,14 @@
+*.weight.txt
+*.bias.txt
+*.npy
+*.pt
+*.nsys-rep
+*.sqlite
+*.zip
+
+
+.vscode
+data
+inference_prog
+infer
+*.txt
