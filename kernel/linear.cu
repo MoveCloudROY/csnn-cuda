@@ -118,32 +118,17 @@ __global__ void linear_forward(
         );
     }
 
-    int threadid = (threadIdx.y * blockDim.x + threadIdx.x);
-    #pragma unroll
-    for (int i = 0; i < BM * BN / 4; i += blockDim.x * blockDim.y ) {
-        int index = threadid + i;
-        int c_row = (index * 4) / BN;
-        int c_col = (index * 4) % BN;
-        if (block_m + c_row < M && block_n + c_col + 3 < N) {
-            float4 b4 = FETCH_FLOAT4(b[block_n + c_col]);
-            float4 tmp;
-            tmp.x = __half2float(Cs[c_row * BN + c_col]) + b4.x;
-            tmp.y = __half2float(Cs[c_row * BN + c_col + 1]) + b4.y;
-            tmp.z = __half2float(Cs[c_row * BN + c_col + 2]) + b4.z;
-            tmp.w = __half2float(Cs[c_row * BN + c_col + 3]) + b4.w;
-            // FETCH_FLOAT4(y[(block_m + c_row) * N + block_n + c_col]) = tmp;
+
+    for (int i = threadIdx.y; i < BM; i += blockDim.y) {
+        for (int j = threadIdx.x; j < BN; j += blockDim.x) {
+            int c_row = block_m + i;
+            int c_col = block_n + j;
+            if (c_row < M && c_col < N) {
+                Cs[i * BN + j]       = __float2half(__half2float(Cs[i * BN + j]) + b[c_col]);
+                y[c_row * N + c_col] = __half2float(Cs[i * BN + j]);
+            }
         }
     }
-    // for (int i = threadIdx.y; i < BM; i += blockDim.y) {
-    //     for (int j = threadIdx.x; j < BN; j += blockDim.x) {
-    //         int c_row = block_m + i;
-    //         int c_col = block_n + j;
-    //         if (c_row < M && c_col < N) {
-    //             Cs[i * BN + j]       = __float2half(__half2float(Cs[i * BN + j]) + b[c_col]);
-    //             y[c_row * N + c_col] = __half2float(Cs[i * BN + j]);
-    //         }
-    //     }
-    // }
 }
 
 
