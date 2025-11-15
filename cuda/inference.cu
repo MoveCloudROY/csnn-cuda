@@ -14,6 +14,7 @@
 #include <cuda_fp16.h>
 #include <cooperative_groups.h>
 #include <mma.h>
+using namespace nvcuda;
 
 // ===================================================================================
 // Helper for CUDA Error Handling - DO NOT MODIFY BEGIN
@@ -98,8 +99,11 @@ std::vector<float> read_param(const std::string& path) {
 // ===================================================================================
 
 // clang-format off
-#define BATCH_SIZE          1000
+#define BATCH_SIZE          2048
+#define STREAM_N            ((10000 + BATCH_SIZE - 1) / BATCH_SIZE)
 #define NEURON_T            2
+#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
+
 // clang-format on
 
 // ===================================================================================
@@ -331,42 +335,314 @@ __global__ void maxpool2x2_s2_nchw_kernel(
     y[y_idx]        = mv;
 }
 
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
+
+#define MATMUL_WARP_M WMMA_M
+#define MATMUL_WARP_N WMMA_N
+#define MATMUL_WARP_K WMMA_K
+
+#define NUM_MATMUL_WARPS_M 4
+#define NUM_MATMUL_WARPS_N 2
+#define NUM_MATMUL_WARPS_K 2
+
+#define MATMUL_BLOCK_M (NUM_MATMUL_WARPS_M * MATMUL_WARP_M)
+#define MATMUL_BLOCK_N (NUM_MATMUL_WARPS_N * MATMUL_WARP_N)
+#define MATMUL_BLOCK_K (NUM_MATMUL_WARPS_K * MATMUL_WARP_K)
+
+
+#define MATMUL_THREAD_M (NUM_MATMUL_WARPS_M * 32)
+#define MATMUL_THREAD_N (NUM_MATMUL_WARPS_N)
+
+
+
+// warp size = 4 * 2 , each warp compute a tile of size 64 * 32
+#define MATMUL4_WARP_M WMMA_M
+#define MATMUL4_WARP_N WMMA_N
+#define MATMUL4_WARP_K WMMA_K
+
+#define NUM_MATMUL4_WARPS_M 4
+#define NUM_MATMUL4_WARPS_N 2
+#define NUM_MATMUL4_WARPS_K 2
+
+#define MATMUL4_BLOCK_M (NUM_MATMUL4_WARPS_M * MATMUL4_WARP_M)
+#define MATMUL4_BLOCK_N (NUM_MATMUL4_WARPS_N * MATMUL4_WARP_N)
+#define MATMUL4_BLOCK_K (NUM_MATMUL4_WARPS_K * MATMUL4_WARP_K)
+
+#define MATMUL4_BLOCK_SKEW_M 16
+#define MATMUL4_BLOCK_SKEW_N 16
+#define MATMUL4_BLOCK_SKEW_K 16
+
+#define MATMUL4_THREAD_M (NUM_MATMUL4_WARPS_M * 32)
+#define MATMUL4_THREAD_N (NUM_MATMUL4_WARPS_N)
+
 // Fully-connected forward: y = W x + b, W: [Out, In], x: [N, In], y: [N, Out]
-__global__ void fc_forward_kernel(
-    const float* __restrict__ x, // [N, In]
-    const float* __restrict__ W, // [Out, In]
-    const float* __restrict__ b, // [Out]
-    float* __restrict__ y,       // [N, Out]
-    int N, int In, int Out
+// __global__ void fc_forward_kernel(
+__global__ void linear_fuse_if(
+    float* x, // [N, In]
+    float* w, // [Out, In]
+    float* b, // [Out]
+    float*       y, // [N, Out]
+    float*       v, // [N, Out]
+    int M, int N, int K
 ) {
-    extern __shared__ float xs[]; // size In
-    const int               n = blockIdx.y;
-    if (n >= N)
-        return;
+    const int BM      = MATMUL4_BLOCK_M;
+    const int BN      = MATMUL4_BLOCK_N;
+    const int BK      = MATMUL4_BLOCK_K;
+    int       block_m = blockIdx.x * BM;
+    int       block_n = blockIdx.y * BN;
 
-    // Stage x[n] into shared memory
-    for (int i = threadIdx.x; i < In; i += blockDim.x) {
-        xs[i] = __ldg(x + n * In + i);
-    }
-    __syncthreads();
-
-    const int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (out_idx >= Out)
-        return;
-
-    const float* w_row = W + out_idx * In;
-    float        acc   = __ldg(b + out_idx);
+    // prepare fragments
+    nvcuda::wmma::
+        fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::row_major>
+            a_frag[NUM_MATMUL4_WARPS_M];
+    nvcuda::wmma::
+        fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::col_major>
+            b_frag[NUM_MATMUL4_WARPS_N];
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half>
+        c_frag[NUM_MATMUL4_WARPS_M * NUM_MATMUL4_WARPS_N];
+    // 缓存A_tile和B_tile
+    __shared__ half As[MATMUL4_BLOCK_M * MATMUL4_BLOCK_K];
+    __shared__ half Bs[MATMUL4_BLOCK_N * MATMUL4_BLOCK_K];
+    __shared__ half Cs[MATMUL4_BLOCK_M * MATMUL4_BLOCK_N];
 
 #pragma unroll
-    for (int i = 0; i < 32; ++i) {
-        // Unroll up to 32 if small; handle generic In in loop below
-    }
-    // Compute dot
-    for (int i = 0; i < In; ++i) {
-        acc = fmaf(xs[i], __ldg(w_row + i), acc);
+    for (int i = 0; i < NUM_MATMUL4_WARPS_M * NUM_MATMUL4_WARPS_N; i++) {
+        nvcuda::wmma::fill_fragment(c_frag[i], __float2half(0.0f));
     }
 
-    y[n * Out + out_idx] = acc;
+#pragma unroll
+    for (int block_k = 0; block_k < K; block_k += BK) {
+        int threadid = (threadIdx.y * blockDim.x + threadIdx.x);
+        // load x tile
+        // float4 tmp = FETCH_FLOAT4(&A[]);
+        for (int i = 0; i < BM * BK / 4; i += blockDim.x * blockDim.y ) {
+            int index = threadid + i;
+            int a_row = (index * 4) / BK;
+            int a_col = (index * 4) % BK;
+            if (index < BM * BK / 4) {
+                float4 tmp = FETCH_FLOAT4(x[(block_m + a_row) * K + block_k + a_col]);
+                half2 h2_0 = __float22half2_rn(make_float2(tmp.x, tmp.y));
+                half2 h2_1 = __float22half2_rn(make_float2(tmp.z, tmp.w));
+                *((half2*)&As[a_row * BK + a_col]) = h2_0;
+                *((half2*)&As[a_row * BK + a_col+ 2]) = h2_1;
+            }
+        }
+
+        __syncthreads();
+        // load w tile
+        for (int i = 0; i < BN * BK / 4; i += blockDim.x * blockDim.y) {
+            int index = threadid + i;
+            int b_row = (index * 4) / BK;
+            int b_col = (index * 4) % BK;
+            if (index < BN * BK / 4) {
+                float4 tmp = FETCH_FLOAT4(w[(block_n + b_row) * K + block_k + b_col]);
+                half2 h2_0 = __float22half2_rn(make_float2(tmp.x, tmp.y));
+                half2 h2_1 = __float22half2_rn(make_float2(tmp.z, tmp.w));
+                *((half2*)&Bs[b_row * BK + b_col]) = h2_0;
+                *((half2*)&Bs[b_row * BK + b_col+ 2]) = h2_1;
+            }
+        }
+        __syncthreads();
+
+
+// calculate warp level
+#pragma unroll
+        for (int warp_k = 0; warp_k < BK; warp_k += MATMUL4_WARP_K) {
+            // use wmma to compute y tile
+            // flatten out 2d grid of threads into in order of increasing threadIdx.x
+            int warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / warpSize;
+
+            int warp_m = warp_id / NUM_MATMUL4_WARPS_N;
+            int warp_n = warp_id % NUM_MATMUL4_WARPS_N;
+            // printf("warp_id=%d, warp_m=%d, warp_n=%d\n", warp_id, warp_m, warp_n);
+
+
+            // load x fragment
+            int a_row = warp_m * MATMUL4_WARP_M;
+            int a_col = warp_k;
+            wmma::load_matrix_sync(a_frag[warp_m], &As[a_row * BK + a_col], BK);
+            // load w fragment
+            int b_row = warp_n * MATMUL4_WARP_N;
+            int b_col = warp_k;
+            wmma::load_matrix_sync(b_frag[warp_n], &Bs[b_row * BK + b_col], BK);
+            // wmma mma
+            wmma::mma_sync(c_frag[warp_id], a_frag[warp_m], b_frag[warp_n], c_frag[warp_id]);
+            // store y fragment
+        }
+        __syncthreads();
+    }
+    // store y fragments to y
+
+    int warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / warpSize;
+    int warp_m  = warp_id / NUM_MATMUL4_WARPS_N;
+    int warp_n  = warp_id % NUM_MATMUL4_WARPS_N;
+    int c_row   = block_m + warp_m * MATMUL4_WARP_M;
+    int c_col   = block_n + warp_n * MATMUL4_WARP_N;
+    if (c_row < M && c_col < N) {
+        wmma::store_matrix_sync(
+            &Cs[warp_m * MATMUL4_WARP_M * BN + warp_n * MATMUL4_WARP_N],
+            c_frag[warp_id],
+            BN,
+            wmma::mem_row_major
+        );
+    }
+    // store y fragments to y
+#pragma unroll
+    for (int i = threadIdx.y; i < BM; i += blockDim.y) {
+        for (int j = threadIdx.x; j < BN; j += blockDim.x) {
+            int c_row = block_m + i;
+            int c_col = block_n + j;
+            if (c_row < M && c_col < N) {
+                // Cs[i * BN + j]       = Cs[i * BN + j] + __float2half(b[c_col]);
+                float vv = v[c_row * N + c_col] + __half2float(Cs[i * BN + j]) + b[c_col];
+                int   f  = vv >= 1.0f;
+                y[c_row * N + c_col] = f;
+                v[c_row * N + c_col] = f ? 0 : vv;
+            }
+        }
+    }
+}
+
+
+__global__ void linear_forward(
+    float* x, // [N, In]
+    float* w, // [Out, In]
+    float* b, // [Out]
+    float*       y, // [N, Out]
+    int M, int N, int K
+) {
+        const int BM      = MATMUL4_BLOCK_M;
+    const int BN      = MATMUL4_BLOCK_N;
+    const int BK      = MATMUL4_BLOCK_K;
+    int       block_m = blockIdx.x * BM;
+    int       block_n = blockIdx.y * BN;
+
+    // prepare fragments
+    nvcuda::wmma::
+        fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::row_major>
+            a_frag[NUM_MATMUL4_WARPS_M];
+    nvcuda::wmma::
+        fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, nvcuda::wmma::col_major>
+            b_frag[NUM_MATMUL4_WARPS_N];
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half>
+        c_frag[NUM_MATMUL4_WARPS_M * NUM_MATMUL4_WARPS_N];
+    // 缓存A_tile和B_tile
+    __shared__ half As[MATMUL4_BLOCK_M * MATMUL4_BLOCK_K];
+    __shared__ half Bs[MATMUL4_BLOCK_N * MATMUL4_BLOCK_K];
+    __shared__ half Cs[MATMUL4_BLOCK_M * MATMUL4_BLOCK_N];
+
+#pragma unroll
+    for (int i = 0; i < NUM_MATMUL4_WARPS_M * NUM_MATMUL4_WARPS_N; i++) {
+        nvcuda::wmma::fill_fragment(c_frag[i], __float2half(0.0f));
+    }
+
+#pragma unroll
+    for (int block_k = 0; block_k < K; block_k += BK) {
+        int threadid = (threadIdx.y * blockDim.x + threadIdx.x);
+        // load x tile
+        // float4 tmp = FETCH_FLOAT4(&A[]);
+        for (int i = 0; i < BM * BK / 4; i += blockDim.x * blockDim.y ) {
+            int index = threadid + i;
+            int a_row = (index * 4) / BK;
+            int a_col = (index * 4) % BK;
+            if (index < BM * BK / 4) {
+                float4 tmp = FETCH_FLOAT4(x[(block_m + a_row) * K + block_k + a_col]);
+                half2 h2_0 = __float22half2_rn(make_float2(tmp.x, tmp.y));
+                half2 h2_1 = __float22half2_rn(make_float2(tmp.z, tmp.w));
+                *((half2*)&As[a_row * BK + a_col]) = h2_0;
+                *((half2*)&As[a_row * BK + a_col+ 2]) = h2_1;
+            }
+        }
+
+        // for (int i = threadIdx.y; i < BM; i += blockDim.y) {
+        //     for (int j = threadIdx.x; j < BK; j += blockDim.x) {
+        //         int a_row = block_m + i;
+        //         int a_col = block_k + j;
+        //         if (a_row < M && a_col < K) {
+        //             As[i * BK + j] = __float2half(A[a_row * K + a_col]);
+        //         }
+        //     }
+        // }
+        __syncthreads();
+        // load w tile
+        for (int i = 0; i < BN * BK / 4; i += blockDim.x * blockDim.y) {
+            int index = threadid + i;
+            int b_row = (index * 4) / BK;
+            int b_col = (index * 4) % BK;
+            if (index < BN * BK / 4) {
+                float4 tmp = FETCH_FLOAT4(w[(block_n + b_row) * K + block_k + b_col]);
+                half2 h2_0 = __float22half2_rn(make_float2(tmp.x, tmp.y));
+                half2 h2_1 = __float22half2_rn(make_float2(tmp.z, tmp.w));
+                *((half2*)&Bs[b_row * BK + b_col]) = h2_0;
+                *((half2*)&Bs[b_row * BK + b_col+ 2]) = h2_1;
+            }
+        }
+        // for (int i = threadIdx.y; i < BN; i += blockDim.y) {
+        //     for (int j = threadIdx.x; j < BK; j += blockDim.x) {
+        //         int b_row = block_n + i;
+        //         int b_col = block_k + j;
+        //         if (b_row < N && b_col < K) {
+        //             Bs[i * BK + j] = __float2half(B[b_row * K + b_col]);
+        //         }
+        //     }
+        // }
+        __syncthreads();
+
+
+// calculate warp level
+#pragma unroll
+        for (int warp_k = 0; warp_k < BK; warp_k += MATMUL4_WARP_K) {
+            // use wmma to compute y tile
+            // flatten out 2d grid of threads into in order of increasing threadIdx.x
+            int warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / warpSize;
+
+            int warp_m = warp_id / NUM_MATMUL4_WARPS_N;
+            int warp_n = warp_id % NUM_MATMUL4_WARPS_N;
+            // printf("warp_id=%d, warp_m=%d, warp_n=%d\n", warp_id, warp_m, warp_n);
+
+
+            // load x fragment
+            int a_row = warp_m * MATMUL4_WARP_M;
+            int a_col = warp_k;
+            wmma::load_matrix_sync(a_frag[warp_m], &As[a_row * BK + a_col], BK);
+            // load w fragment
+            int b_row = warp_n * MATMUL4_WARP_N;
+            int b_col = warp_k;
+            wmma::load_matrix_sync(b_frag[warp_n], &Bs[b_row * BK + b_col], BK);
+            // wmma mma
+            wmma::mma_sync(c_frag[warp_id], a_frag[warp_m], b_frag[warp_n], c_frag[warp_id]);
+            // store y fragment
+        }
+        __syncthreads();
+    }
+    // store y fragments to y
+
+    int warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / warpSize;
+    int warp_m  = warp_id / NUM_MATMUL4_WARPS_N;
+    int warp_n  = warp_id % NUM_MATMUL4_WARPS_N;
+    int c_row   = block_m + warp_m * MATMUL4_WARP_M;
+    int c_col   = block_n + warp_n * MATMUL4_WARP_N;
+    if (c_row < M && c_col < N) {
+        wmma::store_matrix_sync(
+            &Cs[warp_m * MATMUL4_WARP_M * BN + warp_n * MATMUL4_WARP_N],
+            c_frag[warp_id],
+            BN,
+            wmma::mem_row_major
+        );
+    }
+#pragma unroll
+    for (int i = threadIdx.y; i < BM; i += blockDim.y) {
+        for (int j = threadIdx.x; j < BN; j += blockDim.x) {
+            int c_row = block_m + i;
+            int c_col = block_n + j;
+            if (c_row < M && c_col < N) {
+                Cs[i * BN + j]       = __float2half(__half2float(Cs[i * BN + j]) + b[c_col]);
+                y[c_row * N + c_col] = __half2float(Cs[i * BN + j]);
+            }
+        }
+    }
 }
 
 __global__ void add_inplace_kernel(float* __restrict__ a, const float* __restrict__ b, int n) {
@@ -434,7 +710,7 @@ std::vector<int> scnn_inference(
     const int FC3_O = 10;
 
     // Pre-allocate device buffers for the maximum batch size to reuse across batches
-    const int MAX_N = BATCH_SIZE;
+    constexpr int MAX_N = BATCH_SIZE;
 
     float *d_input = nullptr, *d_conv1_out = nullptr, *d_if1_mem = nullptr, *d_if1_spk = nullptr;
     float *d_pool1_out = nullptr, *d_conv2_out = nullptr, *d_if2_mem = nullptr,
@@ -473,36 +749,48 @@ std::vector<int> scnn_inference(
     std::vector<int> batch_preds;
     batch_preds.resize(MAX_N);
 
-    std::vector<float> h_batch; // host staging for input
-    h_batch.resize(MAX_N * C1_IN * I_H * I_W);
+    // std::vector<float> h_batch; // host staging for input
+    // h_batch.resize(MAX_N * C1_IN * I_H * I_W);
+    float * h_batch;
+    cudaMallocHost(&h_batch, sizeof(float) * MAX_N * C1_IN * I_H * I_W);
 
-    printf("num images: %d\n", num_images); 
+    // printf("num images: %d\n", num_images);
 
+
+
+    cudaStream_t stream[STREAM_N];
+    for (int i = 0; i < STREAM_N; i ++)
+    {
+        checkCudaErrors(cudaStreamCreate(&stream[i]));
+    }
     for (int offset = 0; offset < num_images; offset += MAX_N) {
         int N = std::min(MAX_N, num_images - offset);
+        int stream_id = offset / MAX_N;
 
         // Pack host batch into contiguous buffer
         const int in_elems_per_img = C1_IN * I_H * I_W; // 784
         for (int n = 0; n < N; ++n) {
             const float* src = images[offset + n].data();
-            float*       dst = h_batch.data() + n * in_elems_per_img;
+            float*       dst = h_batch + n * in_elems_per_img;
+            
             std::memcpy(dst, src, in_elems_per_img * sizeof(float));
         }
 
         // Copy inputs to device
-        checkCudaErrors(cudaMemcpy(
+        checkCudaErrors(cudaMemcpyAsync(
             d_input,
-            h_batch.data(),
+            h_batch,
             N * in_elems_per_img * sizeof(float),
-            cudaMemcpyHostToDevice
+            cudaMemcpyHostToDevice,
+            stream[stream_id]
         ));
 
         // Zero IF memories and logits sum for this batch
-        checkCudaErrors(cudaMemset(d_if1_mem, 0, N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
-        checkCudaErrors(cudaMemset(d_if2_mem, 0, N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
-        checkCudaErrors(cudaMemset(d_if3_mem, 0, N * FC1_O * sizeof(float)));
-        checkCudaErrors(cudaMemset(d_if4_mem, 0, N * FC2_O * sizeof(float)));
-        checkCudaErrors(cudaMemset(d_logits_sum, 0, N * FC3_O * sizeof(float)));
+        checkCudaErrors(cudaMemsetAsync(d_if1_mem, 0, N * C1_OUT * C1_HO * C1_WO * sizeof(float), stream[stream_id]));
+        checkCudaErrors(cudaMemsetAsync(d_if2_mem, 0, N * C2_OUT * C2_HO * C2_WO * sizeof(float), stream[stream_id]));
+        checkCudaErrors(cudaMemsetAsync(d_if3_mem, 0, N * FC1_O * sizeof(float), stream[stream_id]));
+        checkCudaErrors(cudaMemsetAsync(d_if4_mem, 0, N * FC2_O * sizeof(float), stream[stream_id]));
+        checkCudaErrors(cudaMemsetAsync(d_logits_sum, 0, N * FC3_O * sizeof(float), stream[stream_id]));
 
         // Common launch configs
         const dim3 block2d(16, 16, 1);
@@ -518,9 +806,9 @@ std::vector<int> scnn_inference(
         const int threads1d = 256;
         static int cnt = 0;
         for (int t = 0; t < TT; ++t) {
-            printf("run on %d", ++cnt);
+            // printf("run on %d", ++cnt);
             // Conv1: Cin=1 fast path
-            conv2d_c1_k5_kernel<<<grid_c1, block2d, conv1_smem>>>(
+            conv2d_c1_k5_kernel<<<grid_c1, block2d, conv1_smem, stream[stream_id]>>>(
                 d_input,
                 d_conv1_w,
                 d_conv1_b,
@@ -534,7 +822,7 @@ std::vector<int> scnn_inference(
             {
                 int total  = N * C1_OUT * C1_HO * C1_WO;
                 int blocks = div_up(total, threads1d);
-                ifnode_integrate_fire_kernel<<<blocks, threads1d>>>(
+                ifnode_integrate_fire_kernel<<<blocks, threads1d,0, stream[stream_id]>>>(
                     d_conv1_out,
                     d_if1_mem,
                     d_if1_spk,
@@ -545,7 +833,7 @@ std::vector<int> scnn_inference(
             }
 
             // Pool1: 2x2 stride2
-            maxpool2x2_s2_nchw_kernel<<<grid_pool1, block2d>>>(
+            maxpool2x2_s2_nchw_kernel<<<grid_pool1, block2d, 0, stream[stream_id]>>>(
                 d_if1_spk,
                 d_pool1_out,
                 N,
@@ -558,7 +846,7 @@ std::vector<int> scnn_inference(
             // Conv2: general K=5, grid.z = N only
             {
                 const dim3 grid_c2(div_up(C2_WO, block2d.x), div_up(C2_HO, block2d.y), N);
-                conv2d_nchw_kernel_n_only<5><<<grid_c2, block2d>>>(
+                conv2d_nchw_kernel_n_only<5><<<grid_c2, block2d, 0 , stream[stream_id]>>>(
                     d_pool1_out,
                     d_conv2_w,
                     d_conv2_b,
@@ -576,7 +864,7 @@ std::vector<int> scnn_inference(
             {
                 int total  = N * C2_OUT * C2_HO * C2_WO;
                 int blocks = div_up(total, threads1d);
-                ifnode_integrate_fire_kernel<<<blocks, threads1d>>>(
+                ifnode_integrate_fire_kernel<<<blocks, threads1d,0, stream[stream_id]>>>(
                     d_conv2_out,
                     d_if2_mem,
                     d_if2_spk,
@@ -587,7 +875,7 @@ std::vector<int> scnn_inference(
             }
 
             // Pool2
-            maxpool2x2_s2_nchw_kernel<<<grid_pool2, block2d>>>(
+            maxpool2x2_s2_nchw_kernel<<<grid_pool2, block2d,0, stream[stream_id]>>>(
                 d_if2_spk,
                 d_pool2_out,
                 N,
@@ -602,81 +890,87 @@ std::vector<int> scnn_inference(
             // FC1
             {
                 const int  In = FLAT, Out = FC1_O;
-                const dim3 block(256, 1, 1);
-                const dim3 grid(div_up(Out, 256), N, 1);
-                size_t     smem = In * sizeof(float);
-                fc_forward_kernel<<<grid, block, smem>>>(
+                dim3 blockDim(MATMUL_THREAD_M, MATMUL_THREAD_N);
+                dim3 gridDim(div_up(N, MATMUL_BLOCK_M), div_up(Out, MATMUL_BLOCK_N));
+                // size_t     smem = In * sizeof(float);
+                linear_fuse_if<<<gridDim, blockDim, 0, stream[stream_id]>>>(
                     d_pool2_out,
                     d_fc1_w,
                     d_fc1_b,
                     d_fc1_out,
+                    d_if3_mem,
                     N,
-                    In,
-                    Out
+                    Out,
+                    In
                 );
                 checkCudaErrors(cudaGetLastError());
             }
 
             // IF3
-            {
-                int total  = N * FC1_O;
-                int blocks = div_up(total, threads1d);
-                ifnode_integrate_fire_kernel<<<blocks, threads1d>>>(
-                    d_fc1_out,
-                    d_if3_mem,
-                    d_if3_spk,
-                    1.0f,
-                    total
-                );
-                checkCudaErrors(cudaGetLastError());
-            }
+            // {
+            //     int total  = N * FC1_O;
+            //     int blocks = div_up(total, threads1d);
+            //     ifnode_integrate_fire_kernel<<<blocks, threads1d,0, stream[stream_id]>>>(
+            //         d_fc1_out,
+            //         d_if3_mem,
+            //         d_if3_spk,
+            //         1.0f,
+            //         total
+            //     );
+            //     checkCudaErrors(cudaGetLastError());
+            // }
 
             // FC2
             {
                 const int  In = FC1_O, Out = FC2_O;
-                const dim3 block(256, 1, 1);
-                const dim3 grid(div_up(Out, 256), N, 1);
-                size_t     smem = In * sizeof(float);
-                fc_forward_kernel<<<grid, block, smem>>>(
-                    d_if3_spk,
+                dim3 blockDim(MATMUL_THREAD_M, MATMUL_THREAD_N);
+                dim3 gridDim(div_up(N, MATMUL_BLOCK_M), div_up(Out, MATMUL_BLOCK_N));
+                // const dim3 block(256, 1, 1);
+                // const dim3 grid(div_up(Out, 256), N, 1);
+                // size_t     smem = In * sizeof(float);
+                linear_fuse_if<<<gridDim, blockDim, 0, stream[stream_id]>>>(
+                    d_fc1_out,
                     d_fc2_w,
                     d_fc2_b,
                     d_fc2_out,
+                    d_if4_mem,
                     N,
-                    In,
-                    Out
+                    Out,
+                    In
                 );
                 checkCudaErrors(cudaGetLastError());
             }
 
             // IF4
-            {
-                int total  = N * FC2_O;
-                int blocks = div_up(total, threads1d);
-                ifnode_integrate_fire_kernel<<<blocks, threads1d>>>(
-                    d_fc2_out,
-                    d_if4_mem,
-                    d_if4_spk,
-                    1.0f,
-                    total
-                );
-                checkCudaErrors(cudaGetLastError());
-            }
+            // {
+            //     int total  = N * FC2_O;
+            //     int blocks = div_up(total, threads1d);
+            //     ifnode_integrate_fire_kernel<<<blocks, threads1d,0, stream[stream_id]>>>(
+            //         d_fc2_out,
+            //         d_if4_mem,
+            //         d_if4_spk,
+            //         1.0f,
+            //         total
+            //     );
+            //     checkCudaErrors(cudaGetLastError());
+            // }
 
             // FC3 (logits for this timestep)
             {
                 const int  In = FC2_O, Out = FC3_O;
-                const dim3 block(256, 1, 1);
-                const dim3 grid(div_up(Out, 256), N, 1);
-                size_t     smem = In * sizeof(float);
-                fc_forward_kernel<<<grid, block, smem>>>(
-                    d_if4_spk,
+                dim3 blockDim(MATMUL_THREAD_M, MATMUL_THREAD_N);
+                dim3 gridDim(div_up(N, MATMUL_BLOCK_M), div_up(Out, MATMUL_BLOCK_N));
+                // const dim3 block(256, 1, 1);
+                // const dim3 grid(div_up(Out, 256), N, 1);
+                // size_t     smem = In * sizeof(float);
+                linear_forward<<<gridDim, blockDim, 0, stream[stream_id]>>>(
+                    d_fc2_out,
                     d_fc3_w,
                     d_fc3_b,
                     d_fc3_out,
                     N,
-                    In,
-                    Out
+                    Out,
+                    In
                 );
                 checkCudaErrors(cudaGetLastError());
             }
@@ -685,7 +979,7 @@ std::vector<int> scnn_inference(
             {
                 int total  = N * FC3_O;
                 int blocks = div_up(total, threads1d);
-                add_inplace_kernel<<<blocks, threads1d>>>(d_logits_sum, d_fc3_out, total);
+                add_inplace_kernel<<<blocks, threads1d,0, stream[stream_id]>>>(d_logits_sum, d_fc3_out, total);
                 checkCudaErrors(cudaGetLastError());
             }
         }
@@ -694,7 +988,7 @@ std::vector<int> scnn_inference(
         {
             int total  = N * FC3_O;
             int blocks = div_up(total, threads1d);
-            scale_inplace_kernel<<<blocks, threads1d>>>(d_logits_sum, 1.0f / float(TT), total);
+            scale_inplace_kernel<<<blocks, threads1d,0, stream[stream_id]>>>(d_logits_sum, 1.0f / float(TT), total);
             checkCudaErrors(cudaGetLastError());
         }
 
@@ -702,13 +996,13 @@ std::vector<int> scnn_inference(
         {
             const int threads = 256;
             const int blocks  = div_up(N, threads);
-            argmax10_kernel<<<blocks, threads>>>(d_logits_sum, d_preds, N);
+            argmax10_kernel<<<blocks, threads,0, stream[stream_id]>>>(d_logits_sum, d_preds, N);
             checkCudaErrors(cudaGetLastError());
         }
 
         // Copy predictions to host and append
         checkCudaErrors(
-            cudaMemcpy(batch_preds.data(), d_preds, N * sizeof(int), cudaMemcpyDeviceToHost)
+            cudaMemcpyAsync(batch_preds.data(), d_preds, N * sizeof(int), cudaMemcpyDeviceToHost, stream[stream_id])
         );
         for (int n = 0; n < N; ++n) {
             predictions.push_back(batch_preds[n]);
@@ -734,7 +1028,11 @@ std::vector<int> scnn_inference(
     checkCudaErrors(cudaFree(d_fc3_out));
     checkCudaErrors(cudaFree(d_logits_sum));
     checkCudaErrors(cudaFree(d_preds));
-
+    for (int i = 0; i < STREAM_N; i ++)
+    {
+        checkCudaErrors(cudaStreamSynchronize(stream[i]));
+        checkCudaErrors(cudaStreamDestroy(stream[i]));
+    }
     // Memory is freed in main for parameters.
     return predictions;
 }

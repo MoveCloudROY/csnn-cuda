@@ -315,7 +315,8 @@ def run_check(root, op, img_idx=0, T=2, batch_size=1, save_op=None):
         fc3_ref = F.linear(s4_ref, W['fc3_w'], W['fc3_b'])
         fc3_tst = torch.empty_like(fc3_ref)
         if 'fc3' in op or 'all' in op:
-            mod.linear(s4_tst, W['fc3_w'], W['fc3_b'], fc3_tst)
+            mod.linear(s4_tst, W['fc3_w'], W['fc3_b'], fc3_tst)     # or .abs().sum()
+            print(f"###############, {fc3_tst.data_ptr() % 16}")
             ok_all &= compare(fc3_tst, fc3_ref, f"t={t} fc3")
         else:
             fc3_tst = F.linear(s4_tst, W['fc3_w'], W['fc3_b'])
