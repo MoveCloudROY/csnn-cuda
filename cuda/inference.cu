@@ -687,91 +687,162 @@ std::vector<int> scnn_inference(
 ) {
     std::vector<int> predictions;
     const int        num_images = images.size(); // 1000
-    predictions.reserve(num_images);
+    predictions.resize(num_images);
 
     // SNN-specific parameter, must match training
     constexpr int TT = 2;
 
     // Model fixed shapes from train_9004.py
-    const int C1_IN = 1, C1_OUT = 8, K = 5;
-    const int C2_IN = 8, C2_OUT = 16;
-    const int I_H = 28, I_W = 28;
-    const int C1_HO = I_H - K + 1;            // 24
-    const int C1_WO = I_W - K + 1;            // 24
-    const int P1_HO = C1_HO / 2;              // 12
-    const int P1_WO = C1_WO / 2;              // 12
-    const int C2_HO = P1_HO - K + 1;          // 8
-    const int C2_WO = P1_WO - K + 1;          // 8
-    const int P2_HO = C2_HO / 2;              // 4
-    const int P2_WO = C2_WO / 2;              // 4
-    const int FLAT  = C2_OUT * P2_HO * P2_WO; // 16*4*4=256
-    const int FC1_O = 128;
-    const int FC2_O = 96;
-    const int FC3_O = 10;
+    constexpr int C1_IN = 1, C1_OUT = 8, K = 5;
+    constexpr int C2_IN = 8, C2_OUT = 16;
+    constexpr int I_H = 28, I_W = 28;
+    constexpr int C1_HO = I_H - K + 1;            // 24
+    constexpr int C1_WO = I_W - K + 1;            // 24
+    constexpr int P1_HO = C1_HO / 2;              // 12
+    constexpr int P1_WO = C1_WO / 2;              // 12
+    constexpr int C2_HO = P1_HO - K + 1;          // 8
+    constexpr int C2_WO = P1_WO - K + 1;          // 8
+    constexpr int P2_HO = C2_HO / 2;              // 4
+    constexpr int P2_WO = C2_WO / 2;              // 4
+    constexpr int FLAT  = C2_OUT * P2_HO * P2_WO; // 16*4*4=256
+    constexpr int FC1_O = 128;
+    constexpr int FC2_O = 96;
+    constexpr int FC3_O = 10;
 
     // Pre-allocate device buffers for the maximum batch size to reuse across batches
     constexpr int MAX_N = BATCH_SIZE;
 
-    float *d_input = nullptr, *d_conv1_out = nullptr, *d_if1_mem = nullptr, *d_if1_spk = nullptr;
-    float *d_pool1_out = nullptr, *d_conv2_out = nullptr, *d_if2_mem = nullptr,
-          *d_if2_spk   = nullptr;
-    float* d_pool2_out = nullptr;
-    // FC and logits buffers
-    float *d_fc1_out = nullptr, *d_if3_mem = nullptr, *d_if3_spk = nullptr;
-    float *d_fc2_out = nullptr, *d_if4_mem = nullptr, *d_if4_spk = nullptr;
-    float *d_fc3_out = nullptr, *d_logits_sum = nullptr;
-    int*   d_preds = nullptr;
+    // float *d_input = nullptr, *d_conv1_out = nullptr, *d_if1_mem = nullptr, *d_if1_spk = nullptr;
+    // float *d_pool1_out = nullptr, *d_conv2_out = nullptr, *d_if2_mem = nullptr,
+    //       *d_if2_spk   = nullptr;
+    // float* d_pool2_out = nullptr;
+    // // FC and logits buffers
+    // float *d_fc1_out = nullptr, *d_if3_mem = nullptr, *d_if3_spk = nullptr;
+    // float *d_fc2_out = nullptr, *d_if4_mem = nullptr, *d_if4_spk = nullptr;
+    // float *d_fc3_out = nullptr, *d_logits_sum = nullptr;
+    // int*   d_preds = nullptr;
+
+    
+    size_t d_input_size = MAX_N * C1_IN * I_H * I_W; 
+    size_t d_conv1_out_size = MAX_N * C1_OUT * C1_HO * C1_WO;
+    size_t d_if1_mem_size = d_conv1_out_size;
+    size_t d_if1_spk_size = d_conv1_out_size;
+    size_t d_pool1_out_size = MAX_N * C1_OUT * P1_HO * P1_WO;
+    size_t d_conv2_out_size = MAX_N * C2_OUT * C2_HO * C2_WO;
+    size_t d_if2_mem_size = d_conv2_out_size;
+    size_t d_if2_spk_size = d_conv2_out_size;
+    size_t d_pool2_out_size = MAX_N * C2_OUT * P2_HO * P2_WO;
+    size_t d_fc1_out_size = MAX_N * FC1_O;
+    size_t d_if3_mem_size = d_fc1_out_size;
+    size_t d_if3_spk_size = d_fc1_out_size;
+    size_t d_fc2_out_size = MAX_N * FC2_O;
+    size_t d_if4_mem_size = d_fc2_out_size;
+    size_t d_if4_spk_size = d_fc2_out_size;
+    size_t d_fc3_out_size = MAX_N * FC3_O;
+    size_t d_logits_sum_size = d_fc3_out_size;
+    size_t d_preds_size = MAX_N;
+
+    size_t total_d_size = d_input_size + d_conv1_out_size + d_if1_mem_size + d_if1_spk_size + d_pool1_out_size +
+                          d_conv2_out_size + d_if2_mem_size + d_if2_spk_size +
+                          d_pool2_out_size + d_fc1_out_size + d_if3_mem_size +
+                          d_if3_spk_size + d_fc2_out_size + d_if4_mem_size +
+                          d_if4_spk_size + d_fc3_out_size + d_logits_sum_size +
+                          d_preds_size;
+
+    size_t d_input_offset = 0;
+    size_t d_conv1_out_offset = d_input_offset + d_input_size;
+    size_t d_if1_mem_offset = d_conv1_out_offset + d_conv1_out_size;
+    size_t d_if1_spk_offset = d_if1_mem_offset + d_if1_mem_size;
+    size_t d_pool1_out_offset = d_if1_spk_offset + d_if1_spk_size;
+    size_t d_conv2_out_offset = d_pool1_out_offset + d_pool1_out_size;
+    size_t d_if2_mem_offset = d_conv2_out_offset + d_conv2_out_size;
+    size_t d_if2_spk_offset = d_if2_mem_offset + d_if2_mem_size;
+    size_t d_pool2_out_offset = d_if2_spk_offset + d_if2_spk_size;
+    size_t d_fc1_out_offset = d_pool2_out_offset + d_pool2_out_size;
+    size_t d_if3_mem_offset = d_fc1_out_offset + d_fc1_out_size;
+    size_t d_if3_spk_offset = d_if3_mem_offset + d_if3_mem_size;
+    size_t d_fc2_out_offset = d_if3_spk_offset + d_if3_spk_size;
+    size_t d_if4_mem_offset = d_fc2_out_offset + d_fc2_out_size;
+    size_t d_if4_spk_offset = d_if4_mem_offset + d_if4_mem_size;
+    size_t d_fc3_out_offset = d_if4_spk_offset + d_if4_spk_size;
+    size_t d_logits_sum_offset = d_fc3_out_offset + d_fc3_out_size;
+    size_t d_preds_offset = d_logits_sum_offset + d_logits_sum_size; 
+    // checkCudaErrors(cudaMalloc(&d_workspace, total_d_size));
+
 
     // Allocate with maximum sizes
-    checkCudaErrors(cudaMalloc(&d_input, MAX_N * C1_IN * I_H * I_W * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_conv1_out, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if1_mem, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if1_spk, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_pool1_out, MAX_N * C1_OUT * P1_HO * P1_WO * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_input, MAX_N * C1_IN * I_H * I_W * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_conv1_out, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_if1_mem, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_if1_spk, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_pool1_out, MAX_N * C1_OUT * P1_HO * P1_WO * sizeof(float)));
 
-    checkCudaErrors(cudaMalloc(&d_conv2_out, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if2_mem, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if2_spk, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_pool2_out, MAX_N * C2_OUT * P2_HO * P2_WO * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_conv2_out, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_if2_mem, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_if2_spk, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_pool2_out, MAX_N * C2_OUT * P2_HO * P2_WO * sizeof(float)));
 
-    checkCudaErrors(cudaMalloc(&d_fc1_out, MAX_N * FC1_O * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if3_mem, MAX_N * FC1_O * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if3_spk, MAX_N * FC1_O * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_fc1_out, MAX_N * FC1_O * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_if3_mem, MAX_N * FC1_O * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_if3_spk, MAX_N * FC1_O * sizeof(float)));
 
-    checkCudaErrors(cudaMalloc(&d_fc2_out, MAX_N * FC2_O * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if4_mem, MAX_N * FC2_O * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if4_spk, MAX_N * FC2_O * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_fc2_out, MAX_N * FC2_O * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_if4_mem, MAX_N * FC2_O * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_if4_spk, MAX_N * FC2_O * sizeof(float)));
 
-    checkCudaErrors(cudaMalloc(&d_fc3_out, MAX_N * FC3_O * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_logits_sum, MAX_N * FC3_O * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_preds, MAX_N * sizeof(int)));
+    // checkCudaErrors(cudaMalloc(&d_fc3_out, MAX_N * FC3_O * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_logits_sum, MAX_N * FC3_O * sizeof(float)));
+    // checkCudaErrors(cudaMalloc(&d_preds, MAX_N * sizeof(int)));
 
-    std::vector<int> batch_preds;
-    batch_preds.resize(MAX_N);
+    // std::vector<int> batch_preds;
+    // batch_preds.resize(MAX_N);
 
     // std::vector<float> h_batch; // host staging for input
     // h_batch.resize(MAX_N * C1_IN * I_H * I_W);
-    float * h_batch;
-    cudaMallocHost(&h_batch, sizeof(float) * MAX_N * C1_IN * I_H * I_W);
-
+    
     // printf("num images: %d\n", num_images);
-
-
-
+    
+    
+    
     cudaStream_t stream[STREAM_N];
+    float * d_workspace[STREAM_N];
+    float * h_batch[STREAM_N];
+    int * h_batch_preds[STREAM_N];
     for (int i = 0; i < STREAM_N; i ++)
     {
         checkCudaErrors(cudaStreamCreate(&stream[i]));
+        checkCudaErrors(cudaMalloc(&d_workspace[i], total_d_size * sizeof(float)));
+        checkCudaErrors(cudaMallocHost(&h_batch[i], sizeof(float) * MAX_N * C1_IN * I_H * I_W));
+        checkCudaErrors(cudaMallocHost(&h_batch_preds[i], sizeof(int) * MAX_N));
     }
     for (int offset = 0; offset < num_images; offset += MAX_N) {
         int N = std::min(MAX_N, num_images - offset);
         int stream_id = offset / MAX_N;
 
+        float * d_input = d_workspace[stream_id] + d_input_offset;
+        float * d_conv1_out = d_workspace[stream_id] + d_conv1_out_offset;
+        float * d_if1_mem = d_workspace[stream_id] + d_if1_mem_offset;
+        float * d_if1_spk = d_workspace[stream_id] + d_if1_spk_offset;
+        float * d_pool1_out = d_workspace[stream_id] + d_pool1_out_offset;
+        float * d_conv2_out = d_workspace[stream_id] + d_conv2_out_offset;
+        float * d_if2_mem = d_workspace[stream_id] + d_if2_mem_offset;
+        float * d_if2_spk = d_workspace[stream_id] + d_if2_spk_offset;
+        float * d_pool2_out = d_workspace[stream_id] + d_pool2_out_offset;
+        float * d_fc1_out = d_workspace[stream_id] + d_fc1_out_offset;
+        float * d_if3_mem = d_workspace[stream_id] + d_if3_mem_offset;
+        float * d_if3_spk = d_workspace[stream_id] + d_if3_spk_offset;
+        float * d_fc2_out = d_workspace[stream_id] + d_fc2_out_offset;
+        float * d_if4_mem = d_workspace[stream_id] + d_if4_mem_offset;
+        float * d_if4_spk = d_workspace[stream_id] + d_if4_spk_offset;
+        float * d_fc3_out = d_workspace[stream_id] + d_fc3_out_offset;
+        float * d_logits_sum = d_workspace[stream_id] + d_logits_sum_offset;
+        int   * d_preds = (int*)(d_workspace[stream_id] + d_preds_offset);
+
         // Pack host batch into contiguous buffer
-        const int in_elems_per_img = C1_IN * I_H * I_W; // 784
+        constexpr int in_elems_per_img = C1_IN * I_H * I_W; // 784
         for (int n = 0; n < N; ++n) {
             const float* src = images[offset + n].data();
-            float*       dst = h_batch + n * in_elems_per_img;
+            float*       dst = h_batch[stream_id] + n * in_elems_per_img;
             
             std::memcpy(dst, src, in_elems_per_img * sizeof(float));
         }
@@ -779,18 +850,20 @@ std::vector<int> scnn_inference(
         // Copy inputs to device
         checkCudaErrors(cudaMemcpyAsync(
             d_input,
-            h_batch,
+            h_batch[stream_id],
             N * in_elems_per_img * sizeof(float),
             cudaMemcpyHostToDevice,
             stream[stream_id]
         ));
 
+        
+
         // Zero IF memories and logits sum for this batch
-        checkCudaErrors(cudaMemsetAsync(d_if1_mem, 0, N * C1_OUT * C1_HO * C1_WO * sizeof(float), stream[stream_id]));
-        checkCudaErrors(cudaMemsetAsync(d_if2_mem, 0, N * C2_OUT * C2_HO * C2_WO * sizeof(float), stream[stream_id]));
-        checkCudaErrors(cudaMemsetAsync(d_if3_mem, 0, N * FC1_O * sizeof(float), stream[stream_id]));
-        checkCudaErrors(cudaMemsetAsync(d_if4_mem, 0, N * FC2_O * sizeof(float), stream[stream_id]));
-        checkCudaErrors(cudaMemsetAsync(d_logits_sum, 0, N * FC3_O * sizeof(float), stream[stream_id]));
+        checkCudaErrors(cudaMemsetAsync(d_if1_mem, 0, d_if1_mem_size * sizeof(float), stream[stream_id]));
+        checkCudaErrors(cudaMemsetAsync(d_if2_mem, 0, d_if2_mem_size * sizeof(float), stream[stream_id]));
+        checkCudaErrors(cudaMemsetAsync(d_if3_mem, 0, d_if3_mem_size * sizeof(float), stream[stream_id]));
+        checkCudaErrors(cudaMemsetAsync(d_if4_mem, 0, d_if4_mem_size * sizeof(float), stream[stream_id]));
+        checkCudaErrors(cudaMemsetAsync(d_logits_sum, 0, d_logits_sum_size * sizeof(float), stream[stream_id]));
 
         // Common launch configs
         const dim3 block2d(16, 16, 1);
@@ -804,7 +877,7 @@ std::vector<int> scnn_inference(
 
         // IF launch config
         const int threads1d = 256;
-        static int cnt = 0;
+        // static int cnt = 0;
         for (int t = 0; t < TT; ++t) {
             // printf("run on %d", ++cnt);
             // Conv1: Cin=1 fast path
@@ -831,6 +904,7 @@ std::vector<int> scnn_inference(
                 );
                 checkCudaErrors(cudaGetLastError());
             }
+
 
             // Pool1: 2x2 stride2
             maxpool2x2_s2_nchw_kernel<<<grid_pool1, block2d, 0, stream[stream_id]>>>(
@@ -1002,36 +1076,43 @@ std::vector<int> scnn_inference(
 
         // Copy predictions to host and append
         checkCudaErrors(
-            cudaMemcpyAsync(batch_preds.data(), d_preds, N * sizeof(int), cudaMemcpyDeviceToHost, stream[stream_id])
+            cudaMemcpyAsync(h_batch_preds[stream_id], d_preds, N * sizeof(int), cudaMemcpyDeviceToHost, stream[stream_id])
         );
-        for (int n = 0; n < N; ++n) {
-            predictions.push_back(batch_preds[n]);
-        }
     }
-
+    for (int offset = 0; offset < num_images; offset += MAX_N) {
+        int N = std::min(MAX_N, num_images - offset);
+        int stream_id = offset / MAX_N;
+        // Wait for stream to finish
+        checkCudaErrors(cudaStreamSynchronize(stream[stream_id]));
+        // Append predictions
+        memcpy(predictions.data() + offset, h_batch_preds[stream_id], N * sizeof(int));
+    }
     // Free batch buffers
-    checkCudaErrors(cudaFree(d_input));
-    checkCudaErrors(cudaFree(d_conv1_out));
-    checkCudaErrors(cudaFree(d_if1_mem));
-    checkCudaErrors(cudaFree(d_if1_spk));
-    checkCudaErrors(cudaFree(d_pool1_out));
-    checkCudaErrors(cudaFree(d_conv2_out));
-    checkCudaErrors(cudaFree(d_if2_mem));
-    checkCudaErrors(cudaFree(d_if2_spk));
-    checkCudaErrors(cudaFree(d_pool2_out));
-    checkCudaErrors(cudaFree(d_fc1_out));
-    checkCudaErrors(cudaFree(d_if3_mem));
-    checkCudaErrors(cudaFree(d_if3_spk));
-    checkCudaErrors(cudaFree(d_fc2_out));
-    checkCudaErrors(cudaFree(d_if4_mem));
-    checkCudaErrors(cudaFree(d_if4_spk));
-    checkCudaErrors(cudaFree(d_fc3_out));
-    checkCudaErrors(cudaFree(d_logits_sum));
-    checkCudaErrors(cudaFree(d_preds));
+    
+    // checkCudaErrors(cudaFree(d_input));
+    // checkCudaErrors(cudaFree(d_conv1_out));
+    // checkCudaErrors(cudaFree(d_if1_mem));
+    // checkCudaErrors(cudaFree(d_if1_spk));
+    // checkCudaErrors(cudaFree(d_pool1_out));
+    // checkCudaErrors(cudaFree(d_conv2_out));
+    // checkCudaErrors(cudaFree(d_if2_mem));
+    // checkCudaErrors(cudaFree(d_if2_spk));
+    // checkCudaErrors(cudaFree(d_pool2_out));
+    // checkCudaErrors(cudaFree(d_fc1_out));
+    // checkCudaErrors(cudaFree(d_if3_mem));
+    // checkCudaErrors(cudaFree(d_if3_spk));
+    // checkCudaErrors(cudaFree(d_fc2_out));
+    // checkCudaErrors(cudaFree(d_if4_mem));
+    // checkCudaErrors(cudaFree(d_if4_spk));
+    // checkCudaErrors(cudaFree(d_fc3_out));
+    // checkCudaErrors(cudaFree(d_logits_sum));
+    // checkCudaErrors(cudaFree(d_preds));
     for (int i = 0; i < STREAM_N; i ++)
     {
-        checkCudaErrors(cudaStreamSynchronize(stream[i]));
         checkCudaErrors(cudaStreamDestroy(stream[i]));
+        checkCudaErrors(cudaFree(d_workspace[i]));
+        checkCudaErrors(cudaFreeHost(h_batch[i]));
+        checkCudaErrors(cudaFreeHost(h_batch_preds[i]));
     }
     // Memory is freed in main for parameters.
     return predictions;
