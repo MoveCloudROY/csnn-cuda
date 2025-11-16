@@ -1,7 +1,6 @@
 #pragma once
+#include "common.cuh"
 #include <cuda_runtime.h>
-
-#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 
 #define WMMA_M 16
 #define WMMA_N 16

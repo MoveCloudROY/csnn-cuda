@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include "kernel.cuh"
 #include "linear.cuh"
+#include "conv2d_native.cuh"
 
 
 static inline int div_up(int a, int b) {
@@ -77,6 +78,59 @@ void conv2_k5(torch::Tensor x, torch::Tensor w, torch::Tensor b, torch::Tensor y
     const dim3 block(16, 16, 1);
     const dim3 grid(div_up(Wo, block.x), div_up(Ho, block.y), N);
     conv2d_nchw_kernel_n_only<<<grid, block>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        y.data_ptr<float>(),
+        N,
+        Ci,
+        Hi,
+        Wi,
+        Co
+    );
+    auto err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "conv2 kernel failed: ", cudaGetErrorString(err));
+}
+
+
+void conv1(torch::Tensor x, torch::Tensor w, torch::Tensor b, torch::Tensor y) {
+    TORCH_CHECK(x.is_cuda() && w.is_cuda() && b.is_cuda() && y.is_cuda(), "CUDA tensors req");
+    TORCH_CHECK(
+        x.dtype() == torch::kFloat32 && w.dtype() == torch::kFloat32 &&
+            b.dtype() == torch::kFloat32 && y.dtype() == torch::kFloat32,
+        "float32 only"
+    );
+    TORCH_CHECK(x.dim() == 4 && w.dim() == 4 && y.dim() == 4, "NCHW shapes");
+    float * wptr = w.data_ptr<float>();
+    float * bptr = b.data_ptr<float>();
+    const int  N  = x.size(0);
+    const int  Co = w.size(0);
+    // size_t     smem = (block.x + 4) * (block.y + 4) * sizeof(float);
+    conv2d_c1_k5_native_wrapper(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        y.data_ptr<float>(),
+        N,
+        Co
+    );
+    auto err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "conv1 kernel failed: ", cudaGetErrorString(err));
+}
+
+void conv2(torch::Tensor x, torch::Tensor w, torch::Tensor b, torch::Tensor y) {
+    TORCH_CHECK(x.is_cuda() && w.is_cuda() && b.is_cuda() && y.is_cuda(), "CUDA tensors req");
+    TORCH_CHECK(
+        x.dtype() == torch::kFloat32 && w.dtype() == torch::kFloat32 &&
+            b.dtype() == torch::kFloat32 && y.dtype() == torch::kFloat32,
+        "float32 only"
+    );
+    TORCH_CHECK(x.dim() == 4 && w.dim() == 4 && y.dim() == 4, "NCHW shapes");
+    const int  N = x.size(0), Ci = x.size(1), Hi = x.size(2), Wi = x.size(3), Co = w.size(0);
+    const int  Ho = Hi - 4, Wo = Wi - 4;
+    const dim3 block(16, 16, 1);
+    const dim3 grid(div_up(Wo, block.x), div_up(Ho, block.y), N);
+    conv2d_nchw_native_compress<<<grid, block>>>(
         x.data_ptr<float>(),
         w.data_ptr<float>(),
         b.data_ptr<float>(),
@@ -217,6 +271,7 @@ void linear_fuse_if_forward(
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv1", &conv1, "conv1");
     m.def("conv1_c1k5", &conv1_c1k5, "conv1 c1 k5");
     m.def("conv1_c1k5_implicit", &conv1_c1_k5_implicit, "conv1 c1 k5 implicit gemm");
     m.def("conv2_k5", &conv2_k5, "conv2 k5 general");

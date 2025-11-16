@@ -17,7 +17,7 @@ import argparse
 import os
 import sys
 
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.0;7.5;8.0;8.6")
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.0") # ;7.5;8.0;8.6
 
 import numpy as np
 import torch
@@ -72,9 +72,10 @@ def build_module():
     wrapper = os.path.join(dir, 'torch_wrapper.cu')
     src = os.path.join(dir, 'inline_infer_kernels.cu')
     linear_src = os.path.join(dir, 'linear.cu')
+    conv_src = os.path.join(dir, 'conv2d_native.cu')
     m = load(
         name="inline_infer_kernels",
-        sources=[wrapper, src, linear_src],
+        sources=[wrapper, src, linear_src, conv_src],
         verbose=True,
         with_cuda=True,
         extra_include_paths=[dir],
@@ -92,16 +93,23 @@ def compare(a: torch.Tensor, b: torch.Tensor, name: str, atol=1e-5, rtol=1e-4):
     print(f"{name}: max_abs={max_abs:.6g}, sum={sum} -> {'OK' if ok else 'MISMATCH'}")
     return ok
 
-def save(a: torch.Tensor, b: torch.Tensor, name: str):
+def save(a: torch.Tensor, b: torch.Tensor, name: str, line: int = 100):
     # save a and b to files
     import matplotlib.pyplot as plt
     
     a_np = a.cpu().numpy()
     b_np = b.cpu().numpy()
-    
+    # save the first 1000 line data of a and b
+    a_np = a_np.reshape(a_np.shape[0], -1)
+    b_np = b_np.reshape(b_np.shape[0], -1)
+    if a_np.shape[0] > line:
+        a_np = a_np[:line]
+    if b_np.shape[0] > line:
+        b_np = b_np[:line]
+
     # Save as text files (保持shape)
-    np.savetxt(f"{name}_a.txt", a_np.reshape(a_np.shape[0], -1))
-    np.savetxt(f"{name}_b.txt", b_np.reshape(b_np.shape[0], -1))
+    np.savetxt(f"{name}_a.txt", a_np)
+    np.savetxt(f"{name}_b.txt", b_np)
     
     # Save as heatmap images (热力图) - only last 2 dimensions (H, W)
     # Take a single slice instead of averaging
@@ -176,10 +184,13 @@ def run_check(root, op, img_idx=0, T=2, batch_size=1, save_op=None):
         y_ref = F.conv2d(x, W['conv1_w'], W['conv1_b'], stride=1, padding=0)
         y_tst = torch.empty_like(y_ref)
         if 'conv1' in op or 'all' in op:
-            mod.conv1_c1k5(x, W['conv1_w'], W['conv1_b'], y_tst)
+            mod.conv1(x, W['conv1_w'], W['conv1_b'], y_tst)
             ok_all &= compare(y_tst, y_ref, f"t={t} conv1")
         else:
-            y_tst.copy_(y_ref)
+            y_tst = F.conv2d(x, W['conv1_w'], W['conv1_b'], stride=1, padding=0)
+
+        if 'conv1' in save_op or 'all' in save_op:
+            save(y_ref, y_tst, f"t{t}_conv1")
 
         # IF1
         s1_ref = (v1_ref + y_ref >= 1.0).float(); v1_ref = torch.where(s1_ref > 0, torch.zeros_like(v1_ref), v1_ref + y_ref)
@@ -188,7 +199,7 @@ def run_check(root, op, img_idx=0, T=2, batch_size=1, save_op=None):
             mod.if_integrate(y_tst, v1, s1_tst, 1.0)
             ok_all &= compare(s1_tst, s1_ref, f"t={t} if1")
         else:
-            s1_tst.copy_(s1_ref)
+            s1_tst = (v1 + y_tst >= 1.0).float(); v1 = torch.where(s1_tst > 0, torch.zeros_like(v1), v1 + y_tst)
 
         # pool1
         p1_ref = F.max_pool2d(s1_ref, 2, 2)
@@ -197,7 +208,7 @@ def run_check(root, op, img_idx=0, T=2, batch_size=1, save_op=None):
             mod.pool2x2s2(s1_tst, p1_tst)
             ok_all &= compare(p1_tst, p1_ref, f"t={t} pool1")
         else:
-            p1_tst.copy_(p1_ref)
+            p1_tst = F.max_pool2d(s1_tst, 2, 2) 
 
         if 'pool1' in save_op or 'all' in save_op:
             save(p1_ref, p1_tst, f"t{t}_pool1")
@@ -209,7 +220,7 @@ def run_check(root, op, img_idx=0, T=2, batch_size=1, save_op=None):
             mod.conv2_k5(p1_tst, W['conv2_w'], W['conv2_b'], y2_tst)
             ok_all &= compare(y2_tst, y2_ref, f"t={t} conv2")
         else:
-            y2_tst.copy_(y2_ref)
+            y2_tst = F.conv2d(p1_tst, W['conv2_w'], W['conv2_b'], stride=1, padding=0)
 
         # IF2
         s2_ref = (v2_ref + y2_ref >= 1.0).float(); v2_ref = torch.where(s2_ref > 0, torch.zeros_like(v2_ref), v2_ref + y2_ref)
@@ -218,7 +229,7 @@ def run_check(root, op, img_idx=0, T=2, batch_size=1, save_op=None):
             mod.if_integrate(y2_tst, v2, s2_tst, 1.0)
             ok_all &= compare(s2_tst, s2_ref, f"t={t} if2")
         else:
-            s2_tst.copy_(s2_ref)
+            s2_tst = (v2 + y2_tst >= 1.0).float(); v2 = torch.where(s2_tst > 0, torch.zeros_like(v2), v2 + y2_tst)
         
         if 'if2' in save_op or 'all' in save_op:
             save(s2_ref, s2_tst, f"t{t}_if2")
@@ -230,7 +241,7 @@ def run_check(root, op, img_idx=0, T=2, batch_size=1, save_op=None):
             mod.pool2x2s2(s2_tst, p2_tst)
             ok_all &= compare(p2_tst, p2_ref, f"t={t} pool2")
         else:
-            p2_tst.copy_(p2_ref)
+            p2_tst = F.max_pool2d(s2_tst, 2, 2)
 
         if 'pool2' in save_op or 'all' in save_op:
             save(p2_ref, p2_tst, f"t{t}_pool2")

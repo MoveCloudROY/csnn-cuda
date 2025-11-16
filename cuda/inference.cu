@@ -758,11 +758,11 @@ std::vector<int> scnn_inference(
 
 
 
-    cudaStream_t stream[STREAM_N];
-    for (int i = 0; i < STREAM_N; i ++)
-    {
-        checkCudaErrors(cudaStreamCreate(&stream[i]));
-    }
+    // cudaStream_t stream[STREAM_N];
+    // for (int i = 0; i < STREAM_N; i ++)
+    // {
+    //     checkCudaErrors(cudaStreamCreate(&stream[i]));
+    // }
     for (int offset = 0; offset < num_images; offset += MAX_N) {
         int N = std::min(MAX_N, num_images - offset);
         int stream_id = offset / MAX_N;
@@ -777,20 +777,19 @@ std::vector<int> scnn_inference(
         }
 
         // Copy inputs to device
-        checkCudaErrors(cudaMemcpyAsync(
+        checkCudaErrors(cudaMemcpy(
             d_input,
             h_batch,
             N * in_elems_per_img * sizeof(float),
-            cudaMemcpyHostToDevice,
-            stream[stream_id]
+            cudaMemcpyHostToDevice
         ));
 
         // Zero IF memories and logits sum for this batch
-        checkCudaErrors(cudaMemsetAsync(d_if1_mem, 0, N * C1_OUT * C1_HO * C1_WO * sizeof(float), stream[stream_id]));
-        checkCudaErrors(cudaMemsetAsync(d_if2_mem, 0, N * C2_OUT * C2_HO * C2_WO * sizeof(float), stream[stream_id]));
-        checkCudaErrors(cudaMemsetAsync(d_if3_mem, 0, N * FC1_O * sizeof(float), stream[stream_id]));
-        checkCudaErrors(cudaMemsetAsync(d_if4_mem, 0, N * FC2_O * sizeof(float), stream[stream_id]));
-        checkCudaErrors(cudaMemsetAsync(d_logits_sum, 0, N * FC3_O * sizeof(float), stream[stream_id]));
+        checkCudaErrors(cudaMemset(d_if1_mem, 0, N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_if2_mem, 0, N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_if3_mem, 0, N * FC1_O * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_if4_mem, 0, N * FC2_O * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_logits_sum, 0, N * FC3_O * sizeof(float)));
 
         // Common launch configs
         const dim3 block2d(16, 16, 1);
@@ -808,7 +807,7 @@ std::vector<int> scnn_inference(
         for (int t = 0; t < TT; ++t) {
             // printf("run on %d", ++cnt);
             // Conv1: Cin=1 fast path
-            conv2d_c1_k5_kernel<<<grid_c1, block2d, conv1_smem, stream[stream_id]>>>(
+            conv2d_c1_k5_kernel<<<grid_c1, block2d, conv1_smem>>>(
                 d_input,
                 d_conv1_w,
                 d_conv1_b,
@@ -822,7 +821,7 @@ std::vector<int> scnn_inference(
             {
                 int total  = N * C1_OUT * C1_HO * C1_WO;
                 int blocks = div_up(total, threads1d);
-                ifnode_integrate_fire_kernel<<<blocks, threads1d,0, stream[stream_id]>>>(
+                ifnode_integrate_fire_kernel<<<blocks, threads1d,0>>>(
                     d_conv1_out,
                     d_if1_mem,
                     d_if1_spk,
@@ -833,7 +832,7 @@ std::vector<int> scnn_inference(
             }
 
             // Pool1: 2x2 stride2
-            maxpool2x2_s2_nchw_kernel<<<grid_pool1, block2d, 0, stream[stream_id]>>>(
+            maxpool2x2_s2_nchw_kernel<<<grid_pool1, block2d, 0>>>(
                 d_if1_spk,
                 d_pool1_out,
                 N,
@@ -846,7 +845,7 @@ std::vector<int> scnn_inference(
             // Conv2: general K=5, grid.z = N only
             {
                 const dim3 grid_c2(div_up(C2_WO, block2d.x), div_up(C2_HO, block2d.y), N);
-                conv2d_nchw_kernel_n_only<5><<<grid_c2, block2d, 0 , stream[stream_id]>>>(
+                conv2d_nchw_kernel_n_only<5><<<grid_c2, block2d, 0 >>>(
                     d_pool1_out,
                     d_conv2_w,
                     d_conv2_b,
@@ -864,7 +863,7 @@ std::vector<int> scnn_inference(
             {
                 int total  = N * C2_OUT * C2_HO * C2_WO;
                 int blocks = div_up(total, threads1d);
-                ifnode_integrate_fire_kernel<<<blocks, threads1d,0, stream[stream_id]>>>(
+                ifnode_integrate_fire_kernel<<<blocks, threads1d,0>>>(
                     d_conv2_out,
                     d_if2_mem,
                     d_if2_spk,
@@ -875,7 +874,7 @@ std::vector<int> scnn_inference(
             }
 
             // Pool2
-            maxpool2x2_s2_nchw_kernel<<<grid_pool2, block2d,0, stream[stream_id]>>>(
+            maxpool2x2_s2_nchw_kernel<<<grid_pool2, block2d,0>>>(
                 d_if2_spk,
                 d_pool2_out,
                 N,
@@ -893,7 +892,7 @@ std::vector<int> scnn_inference(
                 dim3 blockDim(MATMUL_THREAD_M, MATMUL_THREAD_N);
                 dim3 gridDim(div_up(N, MATMUL_BLOCK_M), div_up(Out, MATMUL_BLOCK_N));
                 // size_t     smem = In * sizeof(float);
-                linear_fuse_if<<<gridDim, blockDim, 0, stream[stream_id]>>>(
+                linear_fuse_if<<<gridDim, blockDim, 0>>>(
                     d_pool2_out,
                     d_fc1_w,
                     d_fc1_b,
@@ -910,7 +909,7 @@ std::vector<int> scnn_inference(
             // {
             //     int total  = N * FC1_O;
             //     int blocks = div_up(total, threads1d);
-            //     ifnode_integrate_fire_kernel<<<blocks, threads1d,0, stream[stream_id]>>>(
+            //     ifnode_integrate_fire_kernel<<<blocks, threads1d,0>>>(
             //         d_fc1_out,
             //         d_if3_mem,
             //         d_if3_spk,
@@ -928,7 +927,7 @@ std::vector<int> scnn_inference(
                 // const dim3 block(256, 1, 1);
                 // const dim3 grid(div_up(Out, 256), N, 1);
                 // size_t     smem = In * sizeof(float);
-                linear_fuse_if<<<gridDim, blockDim, 0, stream[stream_id]>>>(
+                linear_fuse_if<<<gridDim, blockDim, 0>>>(
                     d_fc1_out,
                     d_fc2_w,
                     d_fc2_b,
@@ -945,7 +944,7 @@ std::vector<int> scnn_inference(
             // {
             //     int total  = N * FC2_O;
             //     int blocks = div_up(total, threads1d);
-            //     ifnode_integrate_fire_kernel<<<blocks, threads1d,0, stream[stream_id]>>>(
+            //     ifnode_integrate_fire_kernel<<<blocks, threads1d,0>>>(
             //         d_fc2_out,
             //         d_if4_mem,
             //         d_if4_spk,
@@ -963,7 +962,7 @@ std::vector<int> scnn_inference(
                 // const dim3 block(256, 1, 1);
                 // const dim3 grid(div_up(Out, 256), N, 1);
                 // size_t     smem = In * sizeof(float);
-                linear_forward<<<gridDim, blockDim, 0, stream[stream_id]>>>(
+                linear_forward<<<gridDim, blockDim, 0>>>(
                     d_fc2_out,
                     d_fc3_w,
                     d_fc3_b,
@@ -979,7 +978,7 @@ std::vector<int> scnn_inference(
             {
                 int total  = N * FC3_O;
                 int blocks = div_up(total, threads1d);
-                add_inplace_kernel<<<blocks, threads1d,0, stream[stream_id]>>>(d_logits_sum, d_fc3_out, total);
+                add_inplace_kernel<<<blocks, threads1d,0>>>(d_logits_sum, d_fc3_out, total);
                 checkCudaErrors(cudaGetLastError());
             }
         }
@@ -988,7 +987,7 @@ std::vector<int> scnn_inference(
         {
             int total  = N * FC3_O;
             int blocks = div_up(total, threads1d);
-            scale_inplace_kernel<<<blocks, threads1d,0, stream[stream_id]>>>(d_logits_sum, 1.0f / float(TT), total);
+            scale_inplace_kernel<<<blocks, threads1d,0>>>(d_logits_sum, 1.0f / float(TT), total);
             checkCudaErrors(cudaGetLastError());
         }
 
@@ -996,13 +995,13 @@ std::vector<int> scnn_inference(
         {
             const int threads = 256;
             const int blocks  = div_up(N, threads);
-            argmax10_kernel<<<blocks, threads,0, stream[stream_id]>>>(d_logits_sum, d_preds, N);
+            argmax10_kernel<<<blocks, threads,0>>>(d_logits_sum, d_preds, N);
             checkCudaErrors(cudaGetLastError());
         }
 
         // Copy predictions to host and append
         checkCudaErrors(
-            cudaMemcpyAsync(batch_preds.data(), d_preds, N * sizeof(int), cudaMemcpyDeviceToHost, stream[stream_id])
+            cudaMemcpy(batch_preds.data(), d_preds, N * sizeof(int), cudaMemcpyDeviceToHost)
         );
         for (int n = 0; n < N; ++n) {
             predictions.push_back(batch_preds[n]);
@@ -1028,11 +1027,11 @@ std::vector<int> scnn_inference(
     checkCudaErrors(cudaFree(d_fc3_out));
     checkCudaErrors(cudaFree(d_logits_sum));
     checkCudaErrors(cudaFree(d_preds));
-    for (int i = 0; i < STREAM_N; i ++)
-    {
-        checkCudaErrors(cudaStreamSynchronize(stream[i]));
-        checkCudaErrors(cudaStreamDestroy(stream[i]));
-    }
+    // for (int i = 0; i < STREAM_N; i ++)
+    // {
+    //     checkCudaErrors(cudaStreamSynchronize(stream[i]));
+    //     checkCudaErrors(cudaStreamDestroy(stream[i]));
+    // }
     // Memory is freed in main for parameters.
     return predictions;
 }
