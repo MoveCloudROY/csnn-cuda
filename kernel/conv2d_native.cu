@@ -4,7 +4,7 @@
 #include <iostream>
 
 
-__constant__ float d_Conv1_ker[CONV_KERNEL_K * CONV_KERNEL_K];
+__constant__ float d_Conv1_ker[CONV1_Co * CONV_KERNEL_K * CONV_KERNEL_K];
 __constant__ float d_Conv1_b[CONV1_Co];
 
 void conv2d_c1_k5_native_wrapper(
@@ -14,17 +14,17 @@ void conv2d_c1_k5_native_wrapper(
     float* __restrict__ y,       // [N, Co=8, 24, 24]
     int N, int Co
 ) {
-    cudaMemcpyToSymbol(d_Conv1_ker, w, CONV_KERNEL_K * CONV_KERNEL_K,0, cudaMemcpyDeviceToDevice);
+    cudaMemcpyToSymbol(d_Conv1_ker, w, CONV1_Co * CONV_KERNEL_K * CONV_KERNEL_K * sizeof(float), 0, cudaMemcpyDeviceToDevice);
     auto err = cudaGetLastError();
     if (err != cudaSuccess) 
         printf("== conv1 w initialize failed: %s\n", cudaGetErrorString(err));
-    cudaMemcpyToSymbol(d_Conv1_b, b, CONV1_Co ,0,cudaMemcpyDeviceToDevice);
+    cudaMemcpyToSymbol(d_Conv1_b, b, CONV1_Co * sizeof(float), 0, cudaMemcpyDeviceToDevice);
     err = cudaGetLastError();
     if (err != cudaSuccess) 
         printf("== conv1 b initialize failed: %s\n", cudaGetErrorString(err));
 
     const dim3 block(CONV1_THREAD_PER_BLOCK);
-    const dim3 grid(CONV1_BLOCK_M * CONV1_BLOCK_N,8, 100);
+    const dim3 grid(CONV1_BLOCK_M * CONV1_BLOCK_N,8, 25);
     conv2d_c1_k5_native<<<grid, block>>>(
         x,
         w,
@@ -59,7 +59,7 @@ __global__ void conv2d_c1_k5_native(
     __shared__ __half result[CONV1_CALC_M_PER_BLOCK * CONV1_CALC_N_PER_BLOCK];
     // int by = blockIdx.y;
     for (int n = blockIdx.z; n < N; n += gridDim.z) {
-        int Co = blockIdx.y; // Co
+        int Co_id = blockIdx.y; // Co
         // for (int n = blockIdx.x; n < N;)
         const int tx    = threadIdx.x;
         int warp_id = tx >> 5;
@@ -103,22 +103,23 @@ __global__ void conv2d_c1_k5_native(
             int warp_col = o % CONV1_CALC_N_PER_BLOCK;
             float acc = 0.0f;
             if (crow < CONV1_KENREL_SIZE) {
-                float wv = d_Conv1_ker[crow * CONV1_KENREL_SIZE + ccol];
-                // TODO: 
+                float wv = d_Conv1_ker[Co_id * CONV1_KENREL_SIZE * CONV1_KENREL_SIZE + crow * CONV1_KENREL_SIZE + ccol];
                 float xv = __half2float(tile[(warp_row + crow) * CONV1_SHARED_N + warp_col + ccol]);
                 acc = xv * wv;
             }
             // warp shuffle to reduce sum
             // (block_row, block_col) + ([0-4], [0-4]) -> (0,0)
             acc = warpReduceSum(acc);
-            acc += d_Conv1_b[Co];
+            if (lane_id == 0) {
+                acc += d_Conv1_b[Co_id];
+                result[warp_row * CONV1_CALC_N_PER_BLOCK + warp_col] = __float2half(acc);
+            }
 
-            result[warp_row * CONV1_CALC_N_PER_BLOCK + warp_col] = __float2half(acc);
                     
             //     } 
             // }
-            __syncthreads();
         }
+        __syncthreads();
         
         // write to y
         for (int i = tx; i < CONV1_CALC_M_PER_BLOCK * CONV1_CALC_N_PER_BLOCK; i += blockDim.x) {
@@ -129,45 +130,11 @@ __global__ void conv2d_c1_k5_native(
             
 
             float v = __half2float(result[irow * CONV1_CALC_N_PER_BLOCK + icol]);
-            y[(n * Co + Co) * CONV1_Ho * CONV1_Wo + row * CONV1_Wo + col] = v;
+            y[(n * Co + Co_id) * CONV1_Ho * CONV1_Wo + row * CONV1_Wo + col] = v;
         }
         __syncthreads();
     }
     
-
-
-//     if (n >= N)
-//         return;
-//     const int ow0 = blockIdx.x * blockDim.x;
-//     const int oh0 = blockIdx.y * blockDim.y;
-//     for (int yy = ty; yy < tileH; yy += blockDim.y) {
-//         int ih = oh0 + yy;
-//         for (int xx = tx; xx < tileW; xx += blockDim.x) {
-//             int   iw = ow0 + xx;
-//             float v  = 0.0f;
-//             if (ih >= 0 && ih < CONV1_Hi && iw >= 0 && iw < CONV1_Wi) {
-//                 const int x_idx = ((n * 1 + 0) * CONV1_Hi + ih) * CONV1_Wi + iw;
-//                 v               = __ldg(x + x_idx);
-//             }
-//             tile[yy * tileW + xx] = v;
-//         }
-//     }
-//     __syncthreads();
-//     if (oh < CONV1_Ho && ow < CONV1_Wo) {
-//         const float* w_oc = w + oc * (CONV_KERNEL_K * CONV_KERNEL_K);
-//         float        acc  = __ldg(b + oc);
-// #pragma unroll
-//         for (int ky = 0; ky < CONV_KERNEL_K; ++ky) {
-// #pragma unroll
-//             for (int kx = 0; kx < CONV_KERNEL_K; ++kx) {
-//                 float xv = tile[(ty + ky) * tileW + (tx + kx)];
-//                 float ww = __ldg(w_oc + ky * CONV_KERNEL_K + kx);
-//                 acc      = fmaf(xv, ww, acc);
-//             }
-//         }
-//         const int y_idx = ((n * Co + oc) * CONV1_Ho + oh) * CONV1_Wo + ow;
-//         y[y_idx]        = acc;
-//     }
 }
 
 

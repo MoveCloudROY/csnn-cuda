@@ -2,6 +2,7 @@
 #include "common.cuh"
 
 #define CONV_KERNEL_K  5
+#define CONV1_KENREL_SIZE 5
 #define CONV1_Hi 28
 #define CONV1_Wi 28
 #define CONV1_IN_SIZE  (CONV1_Hi * CONV1_Wi)
@@ -19,6 +20,11 @@
 
 #define CONV1_THREAD_PER_BLOCK ( 256 ) //192
 #define CONV1_GRIDDIMX 8
+
+
+static_assert(CONV1_SHARED_N % 4 == 0, "FETCH_FLOAT4 need aligned");
+static_assert(CONV1_THREAD_PER_BLOCK >= CONV1_SHARED_M * CONV1_SHARED_N / 4 , "FETCH_FLOAT4 need aligned");
+
 
 
 
