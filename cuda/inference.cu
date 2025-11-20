@@ -103,7 +103,7 @@ std::vector<float> read_param(const std::string& path) {
 #define STREAM_N            ((10000 + BATCH_SIZE - 1) / BATCH_SIZE)
 #define NEURON_T            2
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
-
+#define CONV_KERNEL_K       5
 // clang-format on
 
 // ===================================================================================
@@ -122,136 +122,75 @@ static void dump_host_f32(const char* path, const float* h, size_t n) {
     fclose(f);
 }
 
-template <int K>
-__global__ void conv2d_nchw_kernel(
+
+
+// conv general (NCHW), K=5 templated by compile-time constant
+__global__ void conv2d_nchw_fuse_if_kernel_n_only(
     const float* __restrict__ x, // [N, Ci, Hi, Wi]
     const float* __restrict__ w, // [Co, Ci, K, K]
     const float* __restrict__ b, // [Co]
     float* __restrict__ y,       // [N, Co, Ho, Wo]
+    float* __restrict__ v,
     int N, int Ci, int Hi, int Wi, int Co
 ) {
-    // Grid mapping: (x,y) tile output spatial; z = N*Co, each block handles (n, oc)
-    const int Ho = Hi - K + 1;
-    const int Wo = Wi - K + 1;
-
-    const int oc = blockIdx.z % Co;
-    const int n  = blockIdx.z / Co;
-
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-    const int ow = blockIdx.x * blockDim.x + tx;
-    const int oh = blockIdx.y * blockDim.y + ty;
-
-    if (n >= N || oc >= Co || oh >= Ho || ow >= Wo)
-        return;
-
-    float acc = __ldg(b + oc);
-
-    // For each input channel and kernel element
-    for (int ci = 0; ci < Ci; ++ci) {
-        const int x_base = ((n * Ci + ci) * Hi + oh) * Wi + ow;
-        const int w_base = ((oc * Ci + ci) * K) * K;
-#pragma unroll
-        for (int ky = 0; ky < K; ++ky) {
-#pragma unroll
-            for (int kx = 0; kx < K; ++kx) {
-                float xv = __ldg(x + x_base + ky * Wi + kx);
-                float ww = __ldg(w + w_base + ky * K + kx);
-                acc      = fmaf(xv, ww, acc);
-            }
-        }
-    }
-
-    const int y_idx = ((n * Co + oc) * Ho + oh) * Wo + ow;
-    y[y_idx]        = acc;
-}
-
-// Alternative conv kernel mapping grid.z = N only, iterate oc inside thread
-template <int K>
-__global__ void conv2d_nchw_kernel_n_only(
-    const float* __restrict__ x, // [N, Ci, Hi, Wi]
-    const float* __restrict__ w, // [Co, Ci, K, K]
-    const float* __restrict__ b, // [Co]
-    float* __restrict__ y,       // [N, Co, Ho, Wo]
-    int N, int Ci, int Hi, int Wi, int Co
-) {
-    // Grid mapping: (x,y) tile output spatial for Ho x Wo; z = N only
-    // Each thread computes all output channels at its (oh, ow)
-    const int Ho = Hi - K + 1;
-    const int Wo = Wi - K + 1;
-
+    const int Ho = Hi - CONV_KERNEL_K + 1;
+    const int Wo = Wi - CONV_KERNEL_K + 1;
     const int n  = blockIdx.z;
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
     const int ow = blockIdx.x * blockDim.x + tx;
     const int oh = blockIdx.y * blockDim.y + ty;
-
     if (n >= N || oh >= Ho || ow >= Wo)
         return;
-
-    // Accumulate per output channel
     for (int oc = 0; oc < Co; ++oc) {
         float acc = __ldg(b + oc);
         for (int ci = 0; ci < Ci; ++ci) {
             const int x_base = ((n * Ci + ci) * Hi + oh) * Wi + ow;
-            const int w_base = ((oc * Ci + ci) * K) * K;
+            const int w_base = ((oc * Ci + ci) * CONV_KERNEL_K) * CONV_KERNEL_K;
 #pragma unroll
-            for (int ky = 0; ky < K; ++ky) {
+            for (int ky = 0; ky < CONV_KERNEL_K; ++ky) {
 #pragma unroll
-                for (int kx = 0; kx < K; ++kx) {
+                for (int kx = 0; kx < CONV_KERNEL_K; ++kx) {
                     float xv = __ldg(x + x_base + ky * Wi + kx);
-                    float ww = __ldg(w + w_base + ky * K + kx);
+                    float ww = __ldg(w + w_base + ky * CONV_KERNEL_K + kx);
                     acc      = fmaf(xv, ww, acc);
                 }
             }
         }
         const int y_idx = ((n * Co + oc) * Ho + oh) * Wo + ow;
-        y[y_idx]        = acc;
+        float vm = v[y_idx] + acc;
+        float spike = (vm >= 1.0f) ? 1.0f : 0.0f;
+        y[y_idx]        = spike;
+        v[y_idx] = vm * (1 - spike);
+        // y[y_idx]        = acc;
     }
 }
 
-__global__ void
-ifnode_threshold_kernel(const float* __restrict__ x, float* __restrict__ y, int total) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total)
-        return;
-    float v = x[i];
-    y[i]    = (v >= 1.0f) ? 1.0f : 0.0f;
-}
-
-// Specialized conv for Cin=1, K=5 with shared memory tiling
-__global__ void conv2d_c1_k5_kernel(
+__global__ void conv2d_c1_k5_fuse_if_kernel(
     const float* __restrict__ x, // [N, 1, 28, 28]
-    const float* __restrict__ w, // [Co, 1, 5, 5] flattened (C order)
+    const float* __restrict__ w, // [Co, 1, 5, 5]
     const float* __restrict__ b, // [Co]
     float* __restrict__ y,       // [N, Co, 24, 24]
+    float* __restrict__ v,
     int N, int Co
 ) {
-    constexpr int K  = 5;
-    const int     Hi = 28;
-    const int     Wi = 28;
-    const int     Ho = Hi - K + 1; // 24
-    const int     Wo = Wi - K + 1; // 24
-
-    extern __shared__ float tile[]; // size: (blockDim.y+K-1)*(blockDim.x+K-1)
+    constexpr int           K  = 5;
+    const int               Hi = 28, Wi = 28;
+    const int               Ho = 24, Wo = 24;
+    extern __shared__ float tile[];
     const int               tileW = blockDim.x + K - 1;
     const int               tileH = blockDim.y + K - 1;
-
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-    const int ow = blockIdx.x * blockDim.x + tx;
-    const int oh = blockIdx.y * blockDim.y + ty;
-
-    const int z  = blockIdx.z; // z = n * Co + oc
-    const int oc = z % Co;
-    const int n  = z / Co;
+    const int               tx    = threadIdx.x;
+    const int               ty    = threadIdx.y;
+    const int               ow    = blockIdx.x * blockDim.x + tx;
+    const int               oh    = blockIdx.y * blockDim.y + ty;
+    const int               z     = blockIdx.z;
+    const int               oc    = z % Co;
+    const int               n     = z / Co;
     if (n >= N)
         return;
-
-    // Load input tile for this (n) and spatial tile; Cin=1
     const int ow0 = blockIdx.x * blockDim.x;
     const int oh0 = blockIdx.y * blockDim.y;
-
     for (int yy = ty; yy < tileH; yy += blockDim.y) {
         int ih = oh0 + yy;
         for (int xx = tx; xx < tileW; xx += blockDim.x) {
@@ -265,7 +204,6 @@ __global__ void conv2d_c1_k5_kernel(
         }
     }
     __syncthreads();
-
     if (oh < Ho && ow < Wo) {
         const float* w_oc = w + oc * (K * K);
         float        acc  = __ldg(b + oc);
@@ -279,9 +217,23 @@ __global__ void conv2d_c1_k5_kernel(
             }
         }
         const int y_idx = ((n * Co + oc) * Ho + oh) * Wo + ow;
-        y[y_idx]        = acc;
+        float vm = v[y_idx] + acc;
+        float spike = (vm >= 1.0f) ? 1.0f : 0.0f;
+        y[y_idx]        = spike;
+        v[y_idx] = vm * (1 - spike);
     }
 }
+
+__global__ void
+ifnode_threshold_kernel(const float* __restrict__ x, float* __restrict__ y, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total)
+        return;
+    float v = x[i];
+    y[i]    = (v >= 1.0f) ? 1.0f : 0.0f;
+}
+
+
 
 // Integrate-and-Fire: mem += x; spk = (mem >= thr); hard reset mem=0 when spiking
 __global__ void ifnode_integrate_fire_kernel(
@@ -676,6 +628,12 @@ __global__ void argmax10_kernel(const float* __restrict__ logits, int* __restric
     preds[n] = best_k;
 }
 
+// struct Global {
+//     static void init() {
+//         static
+//     };
+// };
+
 
 
 std::vector<int> scnn_inference(
@@ -796,7 +754,7 @@ std::vector<int> scnn_inference(
         // Conv1: (N*Co) in grid.z, K=5 shared mem tile size
         const size_t conv1_smem = (block2d.x + K - 1) * (block2d.y + K - 1) * sizeof(float);
         const dim3   grid_c1(div_up(C1_WO, block2d.x), div_up(C1_HO, block2d.y), N * C1_OUT);
-
+        const dim3   grid_c2(div_up(C2_WO, block2d.x), div_up(C2_HO, block2d.y), N);
         // Pool kernels configs computed per layer
         const dim3 grid_pool1(div_up(P1_WO, block2d.x), div_up(P1_HO, block2d.y), N * C1_OUT);
         const dim3 grid_pool2(div_up(P2_WO, block2d.x), div_up(P2_HO, block2d.y), N * C2_OUT);
@@ -807,29 +765,30 @@ std::vector<int> scnn_inference(
         for (int t = 0; t < TT; ++t) {
             // printf("run on %d", ++cnt);
             // Conv1: Cin=1 fast path
-            conv2d_c1_k5_kernel<<<grid_c1, block2d, conv1_smem>>>(
+            conv2d_c1_k5_fuse_if_kernel<<<grid_c1, block2d, conv1_smem>>>(
                 d_input,
                 d_conv1_w,
                 d_conv1_b,
-                d_conv1_out,
+                d_if1_spk,
+                d_if1_mem,
                 N,
                 C1_OUT
             );
             checkCudaErrors(cudaGetLastError());
 
             // IF after conv1
-            {
-                int total  = N * C1_OUT * C1_HO * C1_WO;
-                int blocks = div_up(total, threads1d);
-                ifnode_integrate_fire_kernel<<<blocks, threads1d,0>>>(
-                    d_conv1_out,
-                    d_if1_mem,
-                    d_if1_spk,
-                    1.0f,
-                    total
-                );
-                checkCudaErrors(cudaGetLastError());
-            }
+            // {
+            //     int total  = N * C1_OUT * C1_HO * C1_WO;
+            //     int blocks = div_up(total, threads1d);
+            //     ifnode_integrate_fire_kernel<<<blocks, threads1d,0>>>(
+            //         d_conv1_out,
+            //         d_if1_mem,
+            //         d_if1_spk,
+            //         1.0f,
+            //         total
+            //     );
+            //     checkCudaErrors(cudaGetLastError());
+            // }
 
             // Pool1: 2x2 stride2
             maxpool2x2_s2_nchw_kernel<<<grid_pool1, block2d, 0>>>(
@@ -844,12 +803,13 @@ std::vector<int> scnn_inference(
 
             // Conv2: general K=5, grid.z = N only
             {
-                const dim3 grid_c2(div_up(C2_WO, block2d.x), div_up(C2_HO, block2d.y), N);
-                conv2d_nchw_kernel_n_only<5><<<grid_c2, block2d, 0 >>>(
+                
+                conv2d_nchw_fuse_if_kernel_n_only<<<grid_c2, block2d, 0 >>>(
                     d_pool1_out,
                     d_conv2_w,
                     d_conv2_b,
-                    d_conv2_out,
+                    d_if2_spk,
+                    d_if2_mem,
                     N,
                     C2_IN,
                     P1_HO,
@@ -860,18 +820,18 @@ std::vector<int> scnn_inference(
             }
 
             // IF after conv2
-            {
-                int total  = N * C2_OUT * C2_HO * C2_WO;
-                int blocks = div_up(total, threads1d);
-                ifnode_integrate_fire_kernel<<<blocks, threads1d,0>>>(
-                    d_conv2_out,
-                    d_if2_mem,
-                    d_if2_spk,
-                    1.0f,
-                    total
-                );
-                checkCudaErrors(cudaGetLastError());
-            }
+            // {
+            //     int total  = N * C2_OUT * C2_HO * C2_WO;
+            //     int blocks = div_up(total, threads1d);
+            //     ifnode_integrate_fire_kernel<<<blocks, threads1d,0>>>(
+            //         d_conv2_out,
+            //         d_if2_mem,
+            //         d_if2_spk,
+            //         1.0f,
+            //         total
+            //     );
+            //     checkCudaErrors(cudaGetLastError());
+            // }
 
             // Pool2
             maxpool2x2_s2_nchw_kernel<<<grid_pool2, block2d,0>>>(
