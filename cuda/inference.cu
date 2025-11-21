@@ -125,6 +125,7 @@ constexpr int FC1_O = 128;
 constexpr int FC2_O = 96;
 constexpr int FC3_O = 10;
 
+constexpr int MAX_N = BATCH_SIZE;
 // clang-format on
 
 // ===================================================================================
@@ -631,11 +632,62 @@ struct Global {
 
     ~Global()
     {
+        checkCudaErrors(cudaFree(d_input));
+        checkCudaErrors(cudaFree(d_conv1_out));
+        checkCudaErrors(cudaFree(d_if1_mem));
+        checkCudaErrors(cudaFree(d_pool1_out));
+        checkCudaErrors(cudaFree(d_conv2_out));
+        checkCudaErrors(cudaFree(d_if2_mem));
+        checkCudaErrors(cudaFree(d_pool2_out));
+        checkCudaErrors(cudaFree(d_fc1_out));
+        checkCudaErrors(cudaFree(d_if3_mem));
+        checkCudaErrors(cudaFree(d_fc2_out));
+        checkCudaErrors(cudaFree(d_if4_mem));
+        checkCudaErrors(cudaFree(d_fc3_out));
+        checkCudaErrors(cudaFree(d_logits_sum));
+        checkCudaErrors(cudaFree(d_preds));
+        checkCudaErrors(cudaFreeHost(h_batch));
+    }
 
+    float *d_input = nullptr, *d_conv1_out = nullptr, *d_if1_mem = nullptr;
+    float *d_pool1_out = nullptr, *d_conv2_out = nullptr, *d_if2_mem = nullptr;
+    float* d_pool2_out = nullptr;
+    // FC and logits buffers
+    float *d_fc1_out = nullptr, *d_if3_mem = nullptr;
+    float *d_fc2_out = nullptr, *d_if4_mem = nullptr;
+    float *d_fc3_out = nullptr, *d_logits_sum = nullptr;
+    int*   d_preds = nullptr;
+
+    float * h_batch;
+    
+
+private:
+    Global() {
+        // Allocate with maximum sizes
+        checkCudaErrors(cudaMalloc(&d_input, MAX_N * C1_IN * I_H * I_W * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_conv1_out, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_if1_mem, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_pool1_out, MAX_N * C1_OUT * P1_HO * P1_WO * sizeof(float)));
+
+        checkCudaErrors(cudaMalloc(&d_conv2_out, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_if2_mem, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_pool2_out, MAX_N * C2_OUT * P2_HO * P2_WO * sizeof(float)));
+
+        checkCudaErrors(cudaMalloc(&d_fc1_out, MAX_N * FC1_O * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_if3_mem, MAX_N * FC1_O * sizeof(float)));
+
+        checkCudaErrors(cudaMalloc(&d_fc2_out, MAX_N * FC2_O * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_if4_mem, MAX_N * FC2_O * sizeof(float)));
+
+        checkCudaErrors(cudaMalloc(&d_fc3_out, MAX_N * FC3_O * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_logits_sum, MAX_N * FC3_O * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_preds, MAX_N * sizeof(int)));
+    
+        cudaMallocHost(&h_batch, MAX_N * C1_IN * I_H * I_W * sizeof(float));
     }
 };
 
-
+auto& global = Global::Get();
 
 std::vector<int> scnn_inference(
     const std::vector<std::vector<float>>& images,
@@ -649,49 +701,23 @@ std::vector<int> scnn_inference(
     predictions.reserve(num_images);
 
 
-
     // Pre-allocate device buffers for the maximum batch size to reuse across batches
-    constexpr int MAX_N = BATCH_SIZE;
-
-    float *d_input = nullptr, *d_conv1_out = nullptr, *d_if1_mem = nullptr;
-    float *d_pool1_out = nullptr, *d_conv2_out = nullptr, *d_if2_mem = nullptr;
-    float* d_pool2_out = nullptr;
+    float *d_input = global.d_input, *d_conv1_out = global.d_conv1_out, *d_if1_mem = global.d_if1_mem;
+    float *d_pool1_out = global.d_pool1_out, *d_conv2_out = global.d_conv2_out, *d_if2_mem = global.d_if2_mem;
+    float* d_pool2_out = global.d_pool2_out;
     // FC and logits buffers
-    float *d_fc1_out = nullptr, *d_if3_mem = nullptr;
-    float *d_fc2_out = nullptr, *d_if4_mem = nullptr;
-    float *d_fc3_out = nullptr, *d_logits_sum = nullptr;
-    int*   d_preds = nullptr;
+    float *d_fc1_out = global.d_fc1_out, *d_if3_mem = global.d_if3_mem;
+    float *d_fc2_out = global.d_fc2_out, *d_if4_mem = global.d_if4_mem;
+    float *d_fc3_out = global.d_fc2_out, *d_logits_sum = global.d_logits_sum;
+    int*   d_preds = global.d_preds;
 
-    // Allocate with maximum sizes
-    checkCudaErrors(cudaMalloc(&d_input, MAX_N * C1_IN * I_H * I_W * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_conv1_out, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if1_mem, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_pool1_out, MAX_N * C1_OUT * P1_HO * P1_WO * sizeof(float)));
 
-    checkCudaErrors(cudaMalloc(&d_conv2_out, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if2_mem, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_pool2_out, MAX_N * C2_OUT * P2_HO * P2_WO * sizeof(float)));
-
-    checkCudaErrors(cudaMalloc(&d_fc1_out, MAX_N * FC1_O * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if3_mem, MAX_N * FC1_O * sizeof(float)));
-
-    checkCudaErrors(cudaMalloc(&d_fc2_out, MAX_N * FC2_O * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if4_mem, MAX_N * FC2_O * sizeof(float)));
-
-    checkCudaErrors(cudaMalloc(&d_fc3_out, MAX_N * FC3_O * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_logits_sum, MAX_N * FC3_O * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_preds, MAX_N * sizeof(int)));
+    float * h_batch = global.h_batch;
 
     std::vector<int> batch_preds;
     batch_preds.resize(MAX_N);
 
-    // std::vector<float> h_batch; // host staging for input
-    // h_batch.resize(MAX_N * C1_IN * I_H * I_W);
-    float * h_batch;
-    cudaMallocHost(&h_batch, sizeof(float) * MAX_N * C1_IN * I_H * I_W);
-
     // printf("num images: %d\n", num_images);
-
 
 
     // cudaStream_t stream[STREAM_N];
@@ -911,20 +937,6 @@ std::vector<int> scnn_inference(
     }
 
     // Free batch buffers
-    checkCudaErrors(cudaFree(d_input));
-    checkCudaErrors(cudaFree(d_conv1_out));
-    checkCudaErrors(cudaFree(d_if1_mem));
-    checkCudaErrors(cudaFree(d_pool1_out));
-    checkCudaErrors(cudaFree(d_conv2_out));
-    checkCudaErrors(cudaFree(d_if2_mem));
-    checkCudaErrors(cudaFree(d_pool2_out));
-    checkCudaErrors(cudaFree(d_fc1_out));
-    checkCudaErrors(cudaFree(d_if3_mem));
-    checkCudaErrors(cudaFree(d_fc2_out));
-    checkCudaErrors(cudaFree(d_if4_mem));
-    checkCudaErrors(cudaFree(d_fc3_out));
-    checkCudaErrors(cudaFree(d_logits_sum));
-    checkCudaErrors(cudaFree(d_preds));
     // for (int i = 0; i < STREAM_N; i ++)
     // {
     //     checkCudaErrors(cudaStreamSynchronize(stream[i]));
