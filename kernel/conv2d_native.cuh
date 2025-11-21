@@ -66,7 +66,11 @@ void conv2d_c1_k5_native_wrapper(
     int N, int Co
 );
 
-
+__global__ void fused_conv_kernel2(const float* input, const float* weights, const float* biases,
+                                                float* spikes,
+                                                int N, int C, int H, int W,
+                                                int K, int R, int S,
+                                                int Oh, int Ow);
 
 __global__ void conv2d_nchw_native_compress(
     float* __restrict__ x, // [N, Ci=8, Hi=12, Wi=12]

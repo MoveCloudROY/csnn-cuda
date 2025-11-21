@@ -217,7 +217,10 @@ def run_check(root, op, img_idx=0, T=2, batch_size=1, save_op=None, time_op=None
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
-            mod.conv1(x, W['conv1_w'], W['conv1_b'], y_tst)
+            if 'fuse1' in op:
+                mod.conv1_c1k5_fuse_if(x, W['conv1_w'], W['conv1_b'], y_tst, v1)
+            else:
+                mod.conv1_c1k5(x, W['conv1_w'], W['conv1_b'], y_tst)
             if time_conv1:
                 end.record()
                 torch.cuda.synchronize()
@@ -248,7 +251,10 @@ def run_check(root, op, img_idx=0, T=2, batch_size=1, save_op=None, time_op=None
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
-            mod.if_integrate(y_tst, v1, s1_tst, 1.0)
+            if 'fuse1' in op:
+                s1_tst = y_tst
+            else:
+                mod.if_integrate(y_tst, v1, s1_tst, 1.0)
             if time_if1:
                 end.record()
                 torch.cuda.synchronize()
@@ -305,7 +311,10 @@ def run_check(root, op, img_idx=0, T=2, batch_size=1, save_op=None, time_op=None
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
-            mod.conv2_k5(p1_tst, W['conv2_w'], W['conv2_b'], y2_tst)
+            if 'fuse2' in op:
+                mod.conv2_k5_fuse_if(p1_tst, W['conv2_w'], W['conv2_b'], y2_tst, v2)
+            else:
+                mod.conv2_k5(p1_tst, W['conv2_w'], W['conv2_b'], y2_tst)
             if time_conv2:
                 end.record()
                 torch.cuda.synchronize()
@@ -333,7 +342,10 @@ def run_check(root, op, img_idx=0, T=2, batch_size=1, save_op=None, time_op=None
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
-            mod.if_integrate(y2_tst, v2, s2_tst, 1.0)
+            if 'fuse2' in op:
+                s2_tst = y2_tst
+            else:
+                mod.if_integrate(y2_tst, v2, s2_tst, 1.0)
             if time_if2:
                 end.record()
                 torch.cuda.synchronize()

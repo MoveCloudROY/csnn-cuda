@@ -52,7 +52,7 @@ void conv1_c1k5(torch::Tensor x, torch::Tensor w, torch::Tensor b, torch::Tensor
     const int  Co = w.size(0);
     const dim3 block(16, 16, 1);
     const dim3 grid(div_up(24, block.x), div_up(24, block.y), N * Co);
-    size_t     smem = (block.x + 4) * (block.y + 4) * sizeof(float);
+    size_t     smem = (block.x + CONV1_KENREL_SIZE - 1) * (block.y + CONV1_KENREL_SIZE - 1) * sizeof(float);
     conv2d_c1_k5_kernel<<<grid, block, smem>>>(
         x.data_ptr<float>(),
         w.data_ptr<float>(),
@@ -60,6 +60,67 @@ void conv1_c1k5(torch::Tensor x, torch::Tensor w, torch::Tensor b, torch::Tensor
         y.data_ptr<float>(),
         N,
         Co
+    );
+    auto err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "conv1 kernel failed: ", cudaGetErrorString(err));
+}
+
+void conv1_c1k5_fuse_if(torch::Tensor x, torch::Tensor w, torch::Tensor b, torch::Tensor y, torch::Tensor v) {
+    TORCH_CHECK(x.is_cuda() && w.is_cuda() && b.is_cuda() && y.is_cuda(), "CUDA tensors req");
+    TORCH_CHECK(
+        x.dtype() == torch::kFloat32 && w.dtype() == torch::kFloat32 &&
+            b.dtype() == torch::kFloat32 && y.dtype() == torch::kFloat32,
+        "float32 only"
+    );
+    TORCH_CHECK(x.dim() == 4 && w.dim() == 4 && y.dim() == 4, "NCHW shapes");
+    const int  N  = x.size(0);
+    const int  Co = w.size(0);
+    const dim3 block(16, 16, 1);
+    const dim3 grid(div_up(24, block.x), div_up(24, block.y), N * Co);
+    size_t     smem = (block.x + CONV1_KENREL_SIZE - 1) * (block.y + CONV1_KENREL_SIZE - 1) * sizeof(float);
+    conv2d_c1_k5_fuse_if_kernel<<<grid, block, smem>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        y.data_ptr<float>(),
+        v.data_ptr<float>(),
+        N,
+        Co
+    );
+    auto err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "conv1 kernel failed: ", cudaGetErrorString(err));
+}
+
+
+void conv2_kernel2(torch::Tensor x, torch::Tensor w, torch::Tensor b, torch::Tensor y) {
+    TORCH_CHECK(x.is_cuda() && w.is_cuda() && b.is_cuda() && y.is_cuda(), "CUDA tensors req");
+    TORCH_CHECK(
+        x.dtype() == torch::kFloat32 && w.dtype() == torch::kFloat32 &&
+            b.dtype() == torch::kFloat32 && y.dtype() == torch::kFloat32,
+        "float32 only"
+    );
+    TORCH_CHECK(x.dim() == 4 && w.dim() == 4 && y.dim() == 4, "NCHW shapes");
+    const int  N  = x.size(0);
+    const int  Co = w.size(0);
+    dim3 block(8, 8);
+    dim3 grid_dim_conv2((12 + block.x - 1) / block.x, 
+                    (12 + block.y - 1) / block.y, 
+                    N);
+    // const dim3 grid(div_up(24, block.x), div_up(24, block.y), N * Co);
+    fused_conv_kernel2<<<grid_dim_conv2, block>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        y.data_ptr<float>(),
+        N,
+        8,
+        12,
+        12,
+        16,
+        5,
+        5,
+        8,
+        8
     );
     auto err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "conv1 kernel failed: ", cudaGetErrorString(err));
@@ -82,6 +143,34 @@ void conv2_k5(torch::Tensor x, torch::Tensor w, torch::Tensor b, torch::Tensor y
         w.data_ptr<float>(),
         b.data_ptr<float>(),
         y.data_ptr<float>(),
+        N,
+        Ci,
+        Hi,
+        Wi,
+        Co
+    );
+    auto err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "conv2 kernel failed: ", cudaGetErrorString(err));
+}
+
+void conv2_k5_fuse_if(torch::Tensor x, torch::Tensor w, torch::Tensor b, torch::Tensor y, torch::Tensor v) {
+    TORCH_CHECK(x.is_cuda() && w.is_cuda() && b.is_cuda() && y.is_cuda(), "CUDA tensors req");
+    TORCH_CHECK(
+        x.dtype() == torch::kFloat32 && w.dtype() == torch::kFloat32 &&
+            b.dtype() == torch::kFloat32 && y.dtype() == torch::kFloat32,
+        "float32 only"
+    );
+    TORCH_CHECK(x.dim() == 4 && w.dim() == 4 && y.dim() == 4, "NCHW shapes");
+    const int  N = x.size(0), Ci = x.size(1), Hi = x.size(2), Wi = x.size(3), Co = w.size(0);
+    const int  Ho = Hi - 4, Wo = Wi - 4;
+    const dim3 block(16, 16, 1);
+    const dim3 grid(div_up(Wo, block.x), div_up(Ho, block.y), N);
+    conv2d_nchw_fuse_if_kernel_n_only<<<grid, block>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        y.data_ptr<float>(),
+        v.data_ptr<float>(),
         N,
         Ci,
         Hi,
@@ -273,8 +362,11 @@ void linear_fuse_if_forward(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("conv1", &conv1, "conv1");
     m.def("conv1_c1k5", &conv1_c1k5, "conv1 c1 k5");
+    m.def("conv1_c1k5_fuse_if", &conv1_c1k5_fuse_if, "conv1 c1 k5");
+    m.def("conv2_kernel2", &conv2_kernel2, "conv2 kernel2");
     m.def("conv1_c1k5_implicit", &conv1_c1_k5_implicit, "conv1 c1 k5 implicit gemm");
     m.def("conv2_k5", &conv2_k5, "conv2 k5 general");
+    m.def("conv2_k5_fuse_if", &conv2_k5_fuse_if, "conv2 k5 general");
     m.def("pool2x2s2", &pool2x2s2, "maxpool2x2 stride2");
     m.def("if_integrate", &if_integrate, "IF integrate + fire");
     m.def("fc_forward", &fc_forward, "FC forward");

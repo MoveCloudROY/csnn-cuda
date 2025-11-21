@@ -51,6 +51,24 @@ __global__ void conv2d_c1_k5_kernel(
     int N, int Co
 );
 
+__global__ void conv2d_nchw_fuse_if_kernel_n_only(
+    const float* __restrict__ x, // [N, Ci, Hi, Wi]
+    const float* __restrict__ w, // [Co, Ci, K, K]
+    const float* __restrict__ b, // [Co]
+    float* __restrict__ y,       // [N, Co, Ho, Wo]
+    float* __restrict__ v,
+    int N, int Ci, int Hi, int Wi, int Co
+);
+
+__global__ void conv2d_c1_k5_fuse_if_kernel(
+    const float* __restrict__ x, // [N, 1, 28, 28]
+    const float* __restrict__ w, // [Co, 1, 5, 5]
+    const float* __restrict__ b, // [Co]
+    float* __restrict__ y,       // [N, Co, 24, 24]
+    float* __restrict__ v,
+    int N, int Co
+);
+
 __global__ void ifnode_integrate_fire_kernel(
     const float* __restrict__ x, float* __restrict__ mem, float* __restrict__ spk, float thr,
     int total
