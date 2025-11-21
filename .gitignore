@@ -12,3 +12,5 @@ data
 inference_prog
 infer
 *.txt
+
+weight*
