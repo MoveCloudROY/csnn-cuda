@@ -104,6 +104,27 @@ std::vector<float> read_param(const std::string& path) {
 #define NEURON_T            2
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 #define CONV_KERNEL_K       5
+
+// SNN-specific parameter, must match training
+constexpr int TT = 2;
+
+// Model fixed shapes from train_9004.py
+constexpr int C1_IN = 1, C1_OUT = 8, K = 5;
+constexpr int C2_IN = 8, C2_OUT = 16;
+constexpr int I_H = 28, I_W = 28;
+constexpr int C1_HO = I_H - K + 1;            // 24
+constexpr int C1_WO = I_W - K + 1;            // 24
+constexpr int P1_HO = C1_HO / 2;              // 12
+constexpr int P1_WO = C1_WO / 2;              // 12
+constexpr int C2_HO = P1_HO - K + 1;          // 8
+constexpr int C2_WO = P1_WO - K + 1;          // 8
+constexpr int P2_HO = C2_HO / 2;              // 4
+constexpr int P2_WO = C2_WO / 2;              // 4
+constexpr int FLAT  = C2_OUT * P2_HO * P2_WO; // 16*4*4=256
+constexpr int FC1_O = 128;
+constexpr int FC2_O = 96;
+constexpr int FC3_O = 10;
+
 // clang-format on
 
 // ===================================================================================
@@ -121,7 +142,6 @@ static void dump_host_f32(const char* path, const float* h, size_t n) {
     fwrite(h, sizeof(float), n, f);
     fclose(f);
 }
-
 
 
 // conv general (NCHW), K=5 templated by compile-time constant
@@ -224,32 +244,6 @@ __global__ void conv2d_c1_k5_fuse_if_kernel(
     }
 }
 
-__global__ void
-ifnode_threshold_kernel(const float* __restrict__ x, float* __restrict__ y, int total) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total)
-        return;
-    float v = x[i];
-    y[i]    = (v >= 1.0f) ? 1.0f : 0.0f;
-}
-
-
-
-// Integrate-and-Fire: mem += x; spk = (mem >= thr); hard reset mem=0 when spiking
-__global__ void ifnode_integrate_fire_kernel(
-    const float* __restrict__ x, float* __restrict__ mem, float* __restrict__ spk, float thr,
-    int total
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total)
-        return;
-    float v = mem[i] + x[i];
-    // spike when membrane crosses threshold; hard reset to 0
-    float s = v >= thr ? 1.0f : 0.0f;
-    spk[i]  = s;
-    // Reset membrane to zero on spike, keep otherwise
-    mem[i] = (s > 0.0f) ? 0.0f : v;
-}
 
 __global__ void maxpool2x2_s2_nchw_kernel(
     const float* __restrict__ x, // [N, C, Hi, Wi]
@@ -628,11 +622,18 @@ __global__ void argmax10_kernel(const float* __restrict__ logits, int* __restric
     preds[n] = best_k;
 }
 
-// struct Global {
-//     static void init() {
-//         static
-//     };
-// };
+struct Global {
+    static Global& Get()
+    {
+        static Global instance;
+        return instance;
+    }
+
+    ~Global()
+    {
+
+    }
+};
 
 
 
@@ -647,36 +648,17 @@ std::vector<int> scnn_inference(
     const int        num_images = images.size(); // 1000
     predictions.reserve(num_images);
 
-    // SNN-specific parameter, must match training
-    constexpr int TT = 2;
 
-    // Model fixed shapes from train_9004.py
-    const int C1_IN = 1, C1_OUT = 8, K = 5;
-    const int C2_IN = 8, C2_OUT = 16;
-    const int I_H = 28, I_W = 28;
-    const int C1_HO = I_H - K + 1;            // 24
-    const int C1_WO = I_W - K + 1;            // 24
-    const int P1_HO = C1_HO / 2;              // 12
-    const int P1_WO = C1_WO / 2;              // 12
-    const int C2_HO = P1_HO - K + 1;          // 8
-    const int C2_WO = P1_WO - K + 1;          // 8
-    const int P2_HO = C2_HO / 2;              // 4
-    const int P2_WO = C2_WO / 2;              // 4
-    const int FLAT  = C2_OUT * P2_HO * P2_WO; // 16*4*4=256
-    const int FC1_O = 128;
-    const int FC2_O = 96;
-    const int FC3_O = 10;
 
     // Pre-allocate device buffers for the maximum batch size to reuse across batches
     constexpr int MAX_N = BATCH_SIZE;
 
-    float *d_input = nullptr, *d_conv1_out = nullptr, *d_if1_mem = nullptr, *d_if1_spk = nullptr;
-    float *d_pool1_out = nullptr, *d_conv2_out = nullptr, *d_if2_mem = nullptr,
-          *d_if2_spk   = nullptr;
+    float *d_input = nullptr, *d_conv1_out = nullptr, *d_if1_mem = nullptr;
+    float *d_pool1_out = nullptr, *d_conv2_out = nullptr, *d_if2_mem = nullptr;
     float* d_pool2_out = nullptr;
     // FC and logits buffers
-    float *d_fc1_out = nullptr, *d_if3_mem = nullptr, *d_if3_spk = nullptr;
-    float *d_fc2_out = nullptr, *d_if4_mem = nullptr, *d_if4_spk = nullptr;
+    float *d_fc1_out = nullptr, *d_if3_mem = nullptr;
+    float *d_fc2_out = nullptr, *d_if4_mem = nullptr;
     float *d_fc3_out = nullptr, *d_logits_sum = nullptr;
     int*   d_preds = nullptr;
 
@@ -684,21 +666,17 @@ std::vector<int> scnn_inference(
     checkCudaErrors(cudaMalloc(&d_input, MAX_N * C1_IN * I_H * I_W * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_conv1_out, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_if1_mem, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if1_spk, MAX_N * C1_OUT * C1_HO * C1_WO * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_pool1_out, MAX_N * C1_OUT * P1_HO * P1_WO * sizeof(float)));
 
     checkCudaErrors(cudaMalloc(&d_conv2_out, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_if2_mem, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if2_spk, MAX_N * C2_OUT * C2_HO * C2_WO * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_pool2_out, MAX_N * C2_OUT * P2_HO * P2_WO * sizeof(float)));
 
     checkCudaErrors(cudaMalloc(&d_fc1_out, MAX_N * FC1_O * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_if3_mem, MAX_N * FC1_O * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if3_spk, MAX_N * FC1_O * sizeof(float)));
 
     checkCudaErrors(cudaMalloc(&d_fc2_out, MAX_N * FC2_O * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_if4_mem, MAX_N * FC2_O * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if4_spk, MAX_N * FC2_O * sizeof(float)));
 
     checkCudaErrors(cudaMalloc(&d_fc3_out, MAX_N * FC3_O * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_logits_sum, MAX_N * FC3_O * sizeof(float)));
@@ -769,37 +747,27 @@ std::vector<int> scnn_inference(
                 d_input,
                 d_conv1_w,
                 d_conv1_b,
-                d_if1_spk,
+                d_conv1_out,
                 d_if1_mem,
                 N,
                 C1_OUT
             );
-            checkCudaErrors(cudaGetLastError());
-
-            // IF after conv1
-            // {
-            //     int total  = N * C1_OUT * C1_HO * C1_WO;
-            //     int blocks = div_up(total, threads1d);
-            //     ifnode_integrate_fire_kernel<<<blocks, threads1d,0>>>(
-            //         d_conv1_out,
-            //         d_if1_mem,
-            //         d_if1_spk,
-            //         1.0f,
-            //         total
-            //     );
-            //     checkCudaErrors(cudaGetLastError());
-            // }
+            #if defined(CUDA_DEBUG)
+                checkCudaErrors(cudaGetLastError());
+            #endif
 
             // Pool1: 2x2 stride2
             maxpool2x2_s2_nchw_kernel<<<grid_pool1, block2d, 0>>>(
-                d_if1_spk,
+                d_conv1_out,
                 d_pool1_out,
                 N,
                 C1_OUT,
                 C1_HO,
                 C1_WO
             );
-            checkCudaErrors(cudaGetLastError());
+            #if defined(CUDA_DEBUG)
+                checkCudaErrors(cudaGetLastError());
+            #endif
 
             // Conv2: general K=5, grid.z = N only
             {
@@ -808,7 +776,7 @@ std::vector<int> scnn_inference(
                     d_pool1_out,
                     d_conv2_w,
                     d_conv2_b,
-                    d_if2_spk,
+                    d_conv2_out,
                     d_if2_mem,
                     N,
                     C2_IN,
@@ -816,33 +784,23 @@ std::vector<int> scnn_inference(
                     P1_WO,
                     C2_OUT
                 );
-                checkCudaErrors(cudaGetLastError());
+                #if defined(CUDA_DEBUG)
+                    checkCudaErrors(cudaGetLastError());
+                #endif
             }
-
-            // IF after conv2
-            // {
-            //     int total  = N * C2_OUT * C2_HO * C2_WO;
-            //     int blocks = div_up(total, threads1d);
-            //     ifnode_integrate_fire_kernel<<<blocks, threads1d,0>>>(
-            //         d_conv2_out,
-            //         d_if2_mem,
-            //         d_if2_spk,
-            //         1.0f,
-            //         total
-            //     );
-            //     checkCudaErrors(cudaGetLastError());
-            // }
 
             // Pool2
             maxpool2x2_s2_nchw_kernel<<<grid_pool2, block2d,0>>>(
-                d_if2_spk,
+                d_conv2_out,
                 d_pool2_out,
                 N,
                 C2_OUT,
                 C2_HO,
                 C2_WO
             );
-            checkCudaErrors(cudaGetLastError());
+            #if defined(CUDA_DEBUG)
+                checkCudaErrors(cudaGetLastError());
+            #endif
 
             // Flatten is just reinterpretation: [N, 16, 4, 4] -> [N, 256]
 
@@ -862,22 +820,10 @@ std::vector<int> scnn_inference(
                     Out,
                     In
                 );
-                checkCudaErrors(cudaGetLastError());
+                #if defined(CUDA_DEBUG)
+                    checkCudaErrors(cudaGetLastError());
+                #endif
             }
-
-            // IF3
-            // {
-            //     int total  = N * FC1_O;
-            //     int blocks = div_up(total, threads1d);
-            //     ifnode_integrate_fire_kernel<<<blocks, threads1d,0>>>(
-            //         d_fc1_out,
-            //         d_if3_mem,
-            //         d_if3_spk,
-            //         1.0f,
-            //         total
-            //     );
-            //     checkCudaErrors(cudaGetLastError());
-            // }
 
             // FC2
             {
@@ -897,22 +843,10 @@ std::vector<int> scnn_inference(
                     Out,
                     In
                 );
-                checkCudaErrors(cudaGetLastError());
+                #if defined(CUDA_DEBUG)
+                    checkCudaErrors(cudaGetLastError());
+                #endif
             }
-
-            // IF4
-            // {
-            //     int total  = N * FC2_O;
-            //     int blocks = div_up(total, threads1d);
-            //     ifnode_integrate_fire_kernel<<<blocks, threads1d,0>>>(
-            //         d_fc2_out,
-            //         d_if4_mem,
-            //         d_if4_spk,
-            //         1.0f,
-            //         total
-            //     );
-            //     checkCudaErrors(cudaGetLastError());
-            // }
 
             // FC3 (logits for this timestep)
             {
@@ -931,7 +865,9 @@ std::vector<int> scnn_inference(
                     Out,
                     In
                 );
-                checkCudaErrors(cudaGetLastError());
+                #if defined(CUDA_DEBUG)
+                    checkCudaErrors(cudaGetLastError());
+                #endif
             }
 
             // Accumulate logits across time: logits_sum += d_fc3_out
@@ -939,7 +875,9 @@ std::vector<int> scnn_inference(
                 int total  = N * FC3_O;
                 int blocks = div_up(total, threads1d);
                 add_inplace_kernel<<<blocks, threads1d,0>>>(d_logits_sum, d_fc3_out, total);
-                checkCudaErrors(cudaGetLastError());
+                #if defined(CUDA_DEBUG)
+                    checkCudaErrors(cudaGetLastError());
+                #endif
             }
         }
 
@@ -948,7 +886,9 @@ std::vector<int> scnn_inference(
             int total  = N * FC3_O;
             int blocks = div_up(total, threads1d);
             scale_inplace_kernel<<<blocks, threads1d,0>>>(d_logits_sum, 1.0f / float(TT), total);
-            checkCudaErrors(cudaGetLastError());
+            #if defined(CUDA_DEBUG)
+                checkCudaErrors(cudaGetLastError());
+            #endif
         }
 
         // Argmax to predictions
@@ -956,7 +896,9 @@ std::vector<int> scnn_inference(
             const int threads = 256;
             const int blocks  = div_up(N, threads);
             argmax10_kernel<<<blocks, threads,0>>>(d_logits_sum, d_preds, N);
-            checkCudaErrors(cudaGetLastError());
+            #if defined(CUDA_DEBUG)
+                checkCudaErrors(cudaGetLastError());
+            #endif
         }
 
         // Copy predictions to host and append
@@ -972,18 +914,14 @@ std::vector<int> scnn_inference(
     checkCudaErrors(cudaFree(d_input));
     checkCudaErrors(cudaFree(d_conv1_out));
     checkCudaErrors(cudaFree(d_if1_mem));
-    checkCudaErrors(cudaFree(d_if1_spk));
     checkCudaErrors(cudaFree(d_pool1_out));
     checkCudaErrors(cudaFree(d_conv2_out));
     checkCudaErrors(cudaFree(d_if2_mem));
-    checkCudaErrors(cudaFree(d_if2_spk));
     checkCudaErrors(cudaFree(d_pool2_out));
     checkCudaErrors(cudaFree(d_fc1_out));
     checkCudaErrors(cudaFree(d_if3_mem));
-    checkCudaErrors(cudaFree(d_if3_spk));
     checkCudaErrors(cudaFree(d_fc2_out));
     checkCudaErrors(cudaFree(d_if4_mem));
-    checkCudaErrors(cudaFree(d_if4_spk));
     checkCudaErrors(cudaFree(d_fc3_out));
     checkCudaErrors(cudaFree(d_logits_sum));
     checkCudaErrors(cudaFree(d_preds));
