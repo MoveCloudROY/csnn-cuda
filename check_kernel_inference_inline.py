@@ -312,9 +312,9 @@ def run_check(root, op, img_idx=0, T=2, batch_size=1, save_op=None, time_op=None
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
             if 'fuse2' in op:
-                mod.conv2_k5_fuse_if(p1_tst, W['conv2_w'], W['conv2_b'], y2_tst, v2)
+                mod.conv2_fuse_if(p1_tst, W['conv2_w'], W['conv2_b'], y2_tst, v2)
             else:
-                mod.conv2_k5(p1_tst, W['conv2_w'], W['conv2_b'], y2_tst)
+                mod.conv2(p1_tst, W['conv2_w'], W['conv2_b'], y2_tst)
             if time_conv2:
                 end.record()
                 torch.cuda.synchronize()

@@ -217,7 +217,7 @@ void conv2(torch::Tensor x, torch::Tensor w, torch::Tensor b, torch::Tensor y) {
     TORCH_CHECK(x.dim() == 4 && w.dim() == 4 && y.dim() == 4, "NCHW shapes");
     const int  N = x.size(0), Ci = x.size(1), Hi = x.size(2), Wi = x.size(3), Co = w.size(0);
     const int  Ho = Hi - 4, Wo = Wi - 4;
-    const dim3 block(16, 16, 1);
+    const dim3 block(8, 8, 1);
     const dim3 grid(div_up(Wo, block.x), div_up(Ho, block.y), N);
     conv2d_nchw_native_compress<<<grid, block>>>(
         x.data_ptr<float>(),
@@ -232,6 +232,35 @@ void conv2(torch::Tensor x, torch::Tensor w, torch::Tensor b, torch::Tensor y) {
     );
     auto err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "conv2 kernel failed: ", cudaGetErrorString(err));
+}
+
+
+void conv2_fuse_if(torch::Tensor x, torch::Tensor w, torch::Tensor b, torch::Tensor y, torch::Tensor v) {
+    TORCH_CHECK(x.is_cuda() && w.is_cuda() && b.is_cuda() && y.is_cuda(), "CUDA tensors req");
+    TORCH_CHECK(
+        x.dtype() == torch::kFloat32 && w.dtype() == torch::kFloat32 &&
+            b.dtype() == torch::kFloat32 && y.dtype() == torch::kFloat32,
+        "float32 only"
+    );
+    TORCH_CHECK(x.dim() == 4 && w.dim() == 4 && y.dim() == 4, "NCHW shapes");
+    const int  N = x.size(0), Ci = x.size(1), Hi = x.size(2), Wi = x.size(3), Co = w.size(0);
+    const int  Ho = Hi - 4, Wo = Wi - 4;
+    const dim3 block(8, 8, 1);
+    const dim3 grid(div_up(Wo, block.x), div_up(Ho, block.y), N);
+    conv2d_nchw_fuse_if_native_compress<<<grid, block>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        y.data_ptr<float>(),
+        v.data_ptr<float>(),
+        N,
+        Ci,
+        Hi,
+        Wi,
+        Co
+    );
+    auto err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "conv2 fuse kernel failed: ", cudaGetErrorString(err));
 }
 
 void pool2x2s2(torch::Tensor x, torch::Tensor y) {
@@ -361,6 +390,8 @@ void linear_fuse_if_forward(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("conv1", &conv1, "conv1");
+    m.def("conv2", &conv2, "conv2");
+    m.def("conv2_fuse_if", &conv2_fuse_if, "conv2 fuse if");
     m.def("conv1_c1k5", &conv1_c1k5, "conv1 c1 k5");
     m.def("conv1_c1k5_fuse_if", &conv1_c1k5_fuse_if, "conv1 c1 k5");
     m.def("conv2_kernel2", &conv2_kernel2, "conv2 kernel2");

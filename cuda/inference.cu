@@ -7,14 +7,22 @@
 #include <numeric>
 #include <algorithm>
 // Permitted CUDA headers for custom kernels
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#define USE_WMMA 1
+#else
+#define USE_WMMA 0
+#endif
 #include <cstring>
 #include <cuda.h>
+
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include <cuda_fp16.h>
 #include <cooperative_groups.h>
 #include <mma.h>
+#if USE_WMMA
 using namespace nvcuda;
+#endif
 
 // ===================================================================================
 // Helper for CUDA Error Handling - DO NOT MODIFY BEGIN
@@ -36,21 +44,14 @@ void check(cudaError_t err, const char* const func, const char* const file, cons
 // ===================================================================================
 std::vector<std::vector<float>> read_mnist_images(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        std::cerr << "Cannot open file: " << path << std::endl;
-        return {};
-    }
+    if (!file) { std::cerr << "Cannot open file: " << path << std::endl; return {}; }
     int magic_number = 0, num_images = 0, num_rows = 0, num_cols = 0;
-    file.read((char*)&magic_number, 4);
-    magic_number = __builtin_bswap32(magic_number);
-    file.read((char*)&num_images, 4);
-    num_images = __builtin_bswap32(num_images);
-    file.read((char*)&num_rows, 4);
-    num_rows = __builtin_bswap32(num_rows);
-    file.read((char*)&num_cols, 4);
-    num_cols = __builtin_bswap32(num_cols);
+    file.read((char*)&magic_number, 4); magic_number = __builtin_bswap32(magic_number);
+    file.read((char*)&num_images, 4); num_images = __builtin_bswap32(num_images);
+    file.read((char*)&num_rows, 4); num_rows = __builtin_bswap32(num_rows);
+    file.read((char*)&num_cols, 4); num_cols = __builtin_bswap32(num_cols);
     std::vector<std::vector<float>> images(num_images, std::vector<float>(num_rows * num_cols));
-    std::vector<unsigned char>      buffer(num_rows * num_cols);
+    std::vector<unsigned char> buffer(num_rows * num_cols);
     for (int i = 0; i < num_images; ++i) {
         file.read((char*)buffer.data(), buffer.size());
         for (size_t j = 0; j < buffer.size(); ++j) {
@@ -62,35 +63,22 @@ std::vector<std::vector<float>> read_mnist_images(const std::string& path) {
 
 std::vector<int> read_mnist_labels(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        std::cerr << "Cannot open file: " << path << std::endl;
-        return {};
-    }
+    if (!file) { std::cerr << "Cannot open file: " << path << std::endl; return {}; }
     int magic_number = 0, num_items = 0;
-    file.read((char*)&magic_number, 4);
-    magic_number = __builtin_bswap32(magic_number);
-    file.read((char*)&num_items, 4);
-    num_items = __builtin_bswap32(num_items);
-    std::vector<int>           labels(num_items);
+    file.read((char*)&magic_number, 4); magic_number = __builtin_bswap32(magic_number);
+    file.read((char*)&num_items, 4); num_items = __builtin_bswap32(num_items);
+    std::vector<int> labels(num_items);
     std::vector<unsigned char> buffer(num_items);
     file.read((char*)buffer.data(), num_items);
-    for (int i = 0; i < num_items; ++i) {
-        labels[i] = static_cast<int>(buffer[i]);
-    }
+    for(int i = 0; i < num_items; ++i) { labels[i] = static_cast<int>(buffer[i]); }
     return labels;
 }
 
 std::vector<float> read_param(const std::string& path) {
     std::ifstream file(path);
-    if (!file) {
-        std::cerr << "Cannot open parameter file: " << path << std::endl;
-        return {};
-    }
-    std::vector<float> params;
-    float              param;
-    while (file >> param) {
-        params.push_back(param);
-    }
+    if (!file) { std::cerr << "Cannot open parameter file: " << path << std::endl; return {}; }
+    std::vector<float> params; float param;
+    while (file >> param) { params.push_back(param); }
     return params;
 }
 
@@ -98,12 +86,22 @@ std::vector<float> read_param(const std::string& path) {
 // Data and Parameter Loading Functions - DO NOT MODIFY END
 // ===================================================================================
 
+
 // clang-format off
-#define BATCH_SIZE          1024
+#define BATCH_SIZE          512
 #define STREAM_N            ((10000 + BATCH_SIZE - 1) / BATCH_SIZE)
 #define NEURON_T            2
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 #define CONV_KERNEL_K       5
+
+#define CONV2_KENREL_SIZE 5
+#define CONV2_Hi 12
+#define CONV2_Wi 12
+#define CONV2_Ci 8
+#define CONV2_IN_SIZE  (CONV2_Hi * CONV2_Wi)
+#define CONV2_Ho (CONV2_Hi - CONV2_KENREL_SIZE + 1)
+#define CONV2_Wo (CONV2_Wi - CONV2_KENREL_SIZE + 1)
+#define CONV2_Co 16
 
 // SNN-specific parameter, must match training
 constexpr int TT = 2;
@@ -146,46 +144,109 @@ static void dump_host_f32(const char* path, const float* h, size_t n) {
 
 
 // conv general (NCHW), K=5 templated by compile-time constant
-__global__ void conv2d_nchw_fuse_if_kernel_n_only(
-    const float* __restrict__ x, // [N, Ci, Hi, Wi]
-    const float* __restrict__ w, // [Co, Ci, K, K]
-    const float* __restrict__ b, // [Co]
-    float* __restrict__ y,       // [N, Co, Ho, Wo]
+__global__ void conv2d_nchw_fuse_if(
+    float* __restrict__ x, // [N, Ci=8, Hi=12, Wi=12]
+    float* __restrict__ w, // [Co=16, Ci=8, K=5, K=5]
+    float* __restrict__ b, // [Co=16]
+    float* __restrict__ y, // [N, Co=16, Ho=8, Wo=8]
     float* __restrict__ v,
     int N, int Ci, int Hi, int Wi, int Co
 ) {
-    const int Ho = Hi - CONV_KERNEL_K + 1;
-    const int Wo = Wi - CONV_KERNEL_K + 1;
-    const int n  = blockIdx.z;
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-    const int ow = blockIdx.x * blockDim.x + tx;
-    const int oh = blockIdx.y * blockDim.y + ty;
-    if (n >= N || oh >= Ho || ow >= Wo)
-        return;
-    for (int oc = 0; oc < Co; ++oc) {
-        float acc = __ldg(b + oc);
-        for (int ci = 0; ci < Ci; ++ci) {
-            const int x_base = ((n * Ci + ci) * Hi + oh) * Wi + ow;
-            const int w_base = ((oc * Ci + ci) * CONV_KERNEL_K) * CONV_KERNEL_K;
-#pragma unroll
-            for (int ky = 0; ky < CONV_KERNEL_K; ++ky) {
-#pragma unroll
-                for (int kx = 0; kx < CONV_KERNEL_K; ++kx) {
-                    float xv = __ldg(x + x_base + ky * Wi + kx);
-                    float ww = __ldg(w + w_base + ky * CONV_KERNEL_K + kx);
-                    acc      = fmaf(xv, ww, acc);
+    __shared__ float s_tile[2][CONV2_Hi][CONV2_Wi];
+    __shared__ float s_weights[CONV2_Co][CONV2_Ci][CONV2_KENREL_SIZE][CONV2_KENREL_SIZE];
+    __shared__ float s_bias[CONV2_Co];
+    __shared__ float s_v[CONV2_Co][CONV2_Ho][CONV2_Wo];    
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const int threads_per_block = blockDim.x * blockDim.y;
+    const int batch = blockIdx.z;
+    
+    // load weights and bias 
+    constexpr int weight_ld4_cnt = (CONV2_Co * CONV2_Ci * CONV2_KENREL_SIZE * CONV2_KENREL_SIZE) / 4;
+    float4* s_weight_base = ((float4*)&s_weights[0][0][0][0]);
+    float4* global_weight_base = ((float4*)w);
+    for (int i = tid; i < weight_ld4_cnt; i += threads_per_block) {
+        s_weight_base[i] = global_weight_base[i];
+    }
+    float4* s_v_base = ((float4*)&s_v[0][0][0]);
+    float4* global_v_base = ((float4*)v + (size_t)batch * Co * CONV2_Ho * CONV2_Wo / 4);
+    for (int i = tid; i < (CONV2_Co * CONV2_Ho * CONV2_Wo) / 4; i += threads_per_block) {
+        s_v_base[i] = global_v_base[i];
+    }
+    if (tid < CONV2_Co) {
+        s_bias[tid] = b[tid];
+    }
+
+    // compute pipeline 
+
+    // 1. prologue 
+    constexpr int tile_ld4_cnt = (CONV2_Hi * CONV2_Wi) / 4; // 12*12/4 = 36
+    const float4* global_input_base = (const float4*)(x + (size_t)batch * Ci * Hi * Wi);
+    float4* s_tile_base = (float4*)&s_tile[0][0][0];
+    for (int i = tid; i < tile_ld4_cnt; i += threads_per_block) {
+        s_tile_base[i] = global_input_base[i];
+    }
+    __syncthreads();
+    
+    int out_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int out_y = blockIdx.y * blockDim.y + threadIdx.y;
+    int curr_buf_idx = 1;
+    int next_buf_idx = 0;
+    float acc[CONV2_Co] = {0.f};
+    // 2. pipeline cycle
+    #pragma unroll 1
+    for (int in_c = 0; in_c < CONV2_Ci; ++in_c) {
+        next_buf_idx = curr_buf_idx;
+        curr_buf_idx = curr_buf_idx ^ 1;
+        // prefetch
+        if (in_c < CONV2_Ci - 1) {
+            const float4* global_input_ptr = global_input_base + (size_t)(in_c + 1) * tile_ld4_cnt;
+            float4* s_next_tile_ptr = (float4*)&s_tile[next_buf_idx][0][0];
+            for (int i = tid; i < tile_ld4_cnt; i += threads_per_block) {
+                s_next_tile_ptr[i] = global_input_ptr[i];
+            }
+        }
+        
+        // compute
+        if (out_x < CONV2_Wo && out_y < CONV2_Ho){
+            #pragma unroll
+            for (int ky = 0; ky < CONV2_KENREL_SIZE; ++ky) {
+                #pragma unroll
+                for (int kx = 0; kx < CONV2_KENREL_SIZE; ++kx) {
+                    int in_y = out_y + ky;
+                    int in_x = out_x + kx;
+                    float input_val = s_tile[curr_buf_idx][in_y][in_x];
+                    #pragma unroll
+                    for (int out_c = 0; out_c < CONV2_Co; ++out_c) {
+                        float weight_val = s_weights[out_c][in_c][ky][kx];
+                        acc[out_c] += input_val * weight_val;
+                        // atomicAdd(&y[((size_t)batch * Co + out_c) * CONV2_Ho * CONV2_Wo + out_y * CONV2_Wo + out_x], input_val * weight_val);
+                    }
                 }
             }
         }
-        const int y_idx = ((n * Co + oc) * Ho + oh) * Wo + ow;
-        float vm = v[y_idx] + acc;
-        float spike = (vm >= 1.0f) ? 1.0f : 0.0f;
-        y[y_idx]        = spike;
-        v[y_idx] = vm * (1 - spike);
-        // y[y_idx]        = acc;
+        // sync prefetch & compute
+        __syncthreads();
+    }
+    // 3. epologue
+    if (out_x < CONV2_Wo && out_y < CONV2_Ho){
+        size_t y_base_offset = (size_t)batch * Co * CONV2_Ho * CONV2_Wo + out_y * CONV2_Wo + out_x;
+        for (int out_c = 0; out_c < CONV2_Co; ++out_c) {
+            float conv_output = acc[out_c] + s_bias[out_c];
+            size_t y_channel_offset = y_base_offset + (size_t)out_c * CONV2_Ho * CONV2_Wo;
+            
+            // float vm = v[y_channel_offset];
+            float vm = s_v[out_c][out_y][out_x];
+            vm += conv_output;
+            float spike = (vm >= 1.0f) ? 1.0f : 0.0f;
+            
+            y[y_channel_offset] = spike;
+            // y[y_channel_offset] = conv_output;
+            v[y_channel_offset] = vm * (1.0f - spike);
+
+        }
     }
 }
+
 
 __global__ void conv2d_c1_k5_fuse_if_kernel(
     const float* __restrict__ x, // [N, 1, 28, 28]
@@ -334,6 +395,7 @@ __global__ void linear_fuse_if(
     float*       v, // [N, Out]
     int M, int N, int K
 ) {
+#if USE_WMMA
     const int BM      = MATMUL4_BLOCK_M;
     const int BN      = MATMUL4_BLOCK_N;
     const int BK      = MATMUL4_BLOCK_K;
@@ -450,6 +512,7 @@ __global__ void linear_fuse_if(
             }
         }
     }
+#endif
 }
 
 
@@ -460,7 +523,8 @@ __global__ void linear_forward(
     float*       y, // [N, Out]
     int M, int N, int K
 ) {
-        const int BM      = MATMUL4_BLOCK_M;
+#if USE_WMMA
+    const int BM      = MATMUL4_BLOCK_M;
     const int BN      = MATMUL4_BLOCK_N;
     const int BK      = MATMUL4_BLOCK_K;
     int       block_m = blockIdx.x * BM;
@@ -590,6 +654,7 @@ __global__ void linear_forward(
             }
         }
     }
+#endif
 }
 
 __global__ void add_inplace_kernel(float* __restrict__ a, const float* __restrict__ b, int n) {
@@ -814,7 +879,7 @@ std::vector<int> scnn_inference(
             // Conv2: general K=5, grid.z = N only
             {
                 
-                conv2d_nchw_fuse_if_kernel_n_only<<<grid_c2, block2d, 0, stream >>>(
+                conv2d_nchw_fuse_if<<<grid_c2, block2d, 0, stream >>>(
                     d_pool1_out,
                     d_conv2_w,
                     d_conv2_b,
@@ -965,12 +1030,11 @@ std::vector<int> scnn_inference(
         // Append predictions
         memcpy(predictions.data() + offset, global.h_batch_preds[stream_id], N * sizeof(int));
     }
-    // for (int i = 0; i < STREAM_N; i ++)
-    //     checkCudaErrors(cudaStreamSynchronize(global.stream[i]));
 
     // Memory is freed in main for parameters.
     return predictions;
 }
+
 
 // ===================================================================================
 // Main Function -  DO NOT MODIFY BEGIN
@@ -980,28 +1044,25 @@ int main(int argc, char* argv[]) {
         std::cerr << "Usage: " << argv[0] << " <path_to_model_and_data_dir>" << std::endl;
         return 1;
     }
-    std::string dir = argv[1];
-
+	std::string dir = argv[1];
+	
     // Load test data
-    auto images =
-        read_mnist_images(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
-    auto labels =
-        read_mnist_labels(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
-    if (images.empty() || labels.empty())
-        return 1;
+    auto images = read_mnist_images(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
+    auto labels = read_mnist_labels(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
+    if (images.empty() || labels.empty()) return 1;
 
     // Load model parameters to host memory
     auto conv1_w = read_param(dir + "/conv1.weight.txt");
     auto conv1_b = read_param(dir + "/conv1.bias.txt");
     auto conv2_w = read_param(dir + "/conv2.weight.txt");
     auto conv2_b = read_param(dir + "/conv2.bias.txt");
-    auto fc1_w   = read_param(dir + "/fc1.weight.txt");
-    auto fc1_b   = read_param(dir + "/fc1.bias.txt");
-    auto fc2_w   = read_param(dir + "/fc2.weight.txt");
-    auto fc2_b   = read_param(dir + "/fc2.bias.txt");
-    auto fc3_w   = read_param(dir + "/fc3.weight.txt");
-    auto fc3_b   = read_param(dir + "/fc3.bias.txt");
-
+    auto fc1_w = read_param(dir + "/fc1.weight.txt");
+    auto fc1_b = read_param(dir + "/fc1.bias.txt");
+    auto fc2_w = read_param(dir + "/fc2.weight.txt");
+    auto fc2_b = read_param(dir + "/fc2.bias.txt");
+    auto fc3_w = read_param(dir + "/fc3.weight.txt");
+    auto fc3_b = read_param(dir + "/fc3.bias.txt");
+    
     // --- 1. Allocate all necessary GPU memory ---
     // Device pointers for parameters
     float *d_conv1_w, *d_conv1_b, *d_conv2_w, *d_conv2_b;
@@ -1012,92 +1073,51 @@ int main(int argc, char* argv[]) {
     checkCudaErrors(cudaMalloc(&d_conv1_b, conv1_b.size() * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_conv2_w, conv2_w.size() * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_conv2_b, conv2_b.size() * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_fc1_w, fc1_w.size() * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_fc1_b, fc1_b.size() * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_fc2_w, fc2_w.size() * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_fc2_b, fc2_b.size() * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_fc3_w, fc3_w.size() * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_fc3_b, fc3_b.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc1_w,   fc1_w.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc1_b,   fc1_b.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc2_w,   fc2_w.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc2_b,   fc2_b.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc3_w,   fc3_w.size() * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc3_b,   fc3_b.size() * sizeof(float)));
 
     // --- 2. Copy constant parameters from host to device ---
-    checkCudaErrors(cudaMemcpy(
-        d_conv1_w,
-        conv1_w.data(),
-        conv1_w.size() * sizeof(float),
-        cudaMemcpyHostToDevice
-    ));
-    checkCudaErrors(cudaMemcpy(
-        d_conv1_b,
-        conv1_b.data(),
-        conv1_b.size() * sizeof(float),
-        cudaMemcpyHostToDevice
-    ));
-    checkCudaErrors(cudaMemcpy(
-        d_conv2_w,
-        conv2_w.data(),
-        conv2_w.size() * sizeof(float),
-        cudaMemcpyHostToDevice
-    ));
-    checkCudaErrors(cudaMemcpy(
-        d_conv2_b,
-        conv2_b.data(),
-        conv2_b.size() * sizeof(float),
-        cudaMemcpyHostToDevice
-    ));
-    checkCudaErrors(
-        cudaMemcpy(d_fc1_w, fc1_w.data(), fc1_w.size() * sizeof(float), cudaMemcpyHostToDevice)
-    );
-    checkCudaErrors(
-        cudaMemcpy(d_fc1_b, fc1_b.data(), fc1_b.size() * sizeof(float), cudaMemcpyHostToDevice)
-    );
-    checkCudaErrors(
-        cudaMemcpy(d_fc2_w, fc2_w.data(), fc2_w.size() * sizeof(float), cudaMemcpyHostToDevice)
-    );
-    checkCudaErrors(
-        cudaMemcpy(d_fc2_b, fc2_b.data(), fc2_b.size() * sizeof(float), cudaMemcpyHostToDevice)
-    );
-    checkCudaErrors(
-        cudaMemcpy(d_fc3_w, fc3_w.data(), fc3_w.size() * sizeof(float), cudaMemcpyHostToDevice)
-    );
-    checkCudaErrors(
-        cudaMemcpy(d_fc3_b, fc3_b.data(), fc3_b.size() * sizeof(float), cudaMemcpyHostToDevice)
-    );
+    checkCudaErrors(cudaMemcpy(d_conv1_w, conv1_w.data(), conv1_w.size() * sizeof(float), cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_conv1_b, conv1_b.data(), conv1_b.size() * sizeof(float), cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_conv2_w, conv2_w.data(), conv2_w.size() * sizeof(float), cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_conv2_b, conv2_b.data(), conv2_b.size() * sizeof(float), cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_fc1_w, fc1_w.data(), fc1_w.size() * sizeof(float), cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_fc1_b, fc1_b.data(), fc1_b.size() * sizeof(float), cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_fc2_w, fc2_w.data(), fc2_w.size() * sizeof(float), cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_fc2_b, fc2_b.data(), fc2_b.size() * sizeof(float), cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_fc3_w, fc3_w.data(), fc3_w.size() * sizeof(float), cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_fc3_b, fc3_b.data(), fc3_b.size() * sizeof(float), cudaMemcpyHostToDevice));
 
     // Start timer
     auto start = std::chrono::high_resolution_clock::now();
-
-    // ===================================================================================
-    // Main Function -  DO NOT MODIFY END
-    // ===================================================================================
+    
+// ===================================================================================
+// Main Function -  DO NOT MODIFY END
+// ===================================================================================
 
     // --- 3. Perform inference ---
     // Pass device pointers to the inference function
-    std::vector<int> predictions = scnn_inference(
-        images,
-        d_conv1_w,
-        d_conv1_b,
-        d_conv2_w,
-        d_conv2_b,
-        d_fc1_w,
-        d_fc1_b,
-        d_fc2_w,
-        d_fc2_b,
-        d_fc3_w,
-        d_fc3_b
+    std::vector<int> predictions = scnn_inference(images,
+        d_conv1_w, d_conv1_b, d_conv2_w, d_conv2_b,
+        d_fc1_w, d_fc1_b, d_fc2_w, d_fc2_b, d_fc3_w, d_fc3_b
         // YOU CAN ADD MORE PARAMETERS HERE!!!
-    );
-
-    // ===================================================================================
-    // Main Function -  DO NOT MODIFY BEGIN
-    // ===================================================================================
+        );
+    
+// ===================================================================================
+// Main Function -  DO NOT MODIFY BEGIN
+// ===================================================================================
 
     // Synchronize to ensure all GPU work is done before stopping the timer
     checkCudaErrors(cudaDeviceSynchronize());
-
+    
     // Stop timer
-    auto                          end  = std::chrono::high_resolution_clock::now();
+    auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff = end - start;
-
+    
     // --- 4. Free all allocated GPU memory ---
     checkCudaErrors(cudaFree(d_conv1_w));
     checkCudaErrors(cudaFree(d_conv1_b));
@@ -1109,7 +1129,7 @@ int main(int argc, char* argv[]) {
     checkCudaErrors(cudaFree(d_fc2_b));
     checkCudaErrors(cudaFree(d_fc3_w));
     checkCudaErrors(cudaFree(d_fc3_b));
-
+    
     // Calculate accuracy
     int correct_predictions = 0;
     for (size_t i = 0; i < labels.size(); ++i) {
@@ -1118,10 +1138,10 @@ int main(int argc, char* argv[]) {
         }
     }
     double accuracy = static_cast<double>(correct_predictions) / labels.size();
-
+    
     // Output result in the required format
     std::cout << std::fixed << std::setprecision(4) << diff.count() << ":" << accuracy << std::endl;
-
+    
     return 0;
 }
 // ===================================================================================

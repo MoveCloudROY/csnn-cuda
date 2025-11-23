@@ -66,6 +66,17 @@ void conv2d_c1_k5_native_wrapper(
     int N, int Co
 );
 
+
+#define CONV2_KENREL_SIZE 5
+#define CONV2_Hi 12
+#define CONV2_Wi 12
+#define CONV2_Ci 8
+#define CONV2_IN_SIZE  (CONV2_Hi * CONV2_Wi)
+#define CONV2_Ho (CONV2_Hi - CONV2_KENREL_SIZE + 1)
+#define CONV2_Wo (CONV2_Wi - CONV2_KENREL_SIZE + 1)
+#define CONV2_Co 16
+
+
 __global__ void fused_conv_kernel2(const float* input, const float* weights, const float* biases,
                                                 float* spikes,
                                                 int N, int C, int H, int W,
@@ -77,6 +88,15 @@ __global__ void conv2d_nchw_native_compress(
     float* __restrict__ w, // [Co=16, Ci=8, K=5, K=5]
     float* __restrict__ b, // [Co=16]
     float* __restrict__ y,       // [N, Co=16, Ho=8, Wo=8]
+    int N, int Ci, int Hi, int Wi, int Co
+);
+
+__global__ void conv2d_nchw_fuse_if_native_compress(
+    float* __restrict__ x, // [N, Ci=8, Hi=12, Wi=12]
+    float* __restrict__ w, // [Co=16, Ci=8, K=5, K=5]
+    float* __restrict__ b, // [Co=16]
+    float* __restrict__ y,       // [N, Co=16, Ho=8, Wo=8]
+    float* __restrict__ v,
     int N, int Ci, int Hi, int Wi, int Co
 );
 

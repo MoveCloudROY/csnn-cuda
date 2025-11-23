@@ -159,7 +159,7 @@ __global__ void fused_conv_kernel2(const float* input, const float* weights, con
     // 加载权重 (2400 floats = 600 float4s)
     float4* s_weights_f4 = (float4*)&s_weights[0][0][0][0];
     const float4* global_weights_f4 = (const float4*)weights;
-    for (int i = tid; i < 600; i += threads_per_block) {
+    for (int i = tid; i < 800; i += threads_per_block) {
         s_weights_f4[i] = global_weights_f4[i];
     }
 
@@ -262,8 +262,192 @@ __global__ void conv2d_nchw_native_compress(
     float* __restrict__ x, // [N, Ci=8, Hi=12, Wi=12]
     float* __restrict__ w, // [Co=16, Ci=8, K=5, K=5]
     float* __restrict__ b, // [Co=16]
-    float* __restrict__ y,       // [N, Co=16, Ho=8, Wo=8]
+    float* __restrict__ y, // [N, Co=16, Ho=8, Wo=8]
     int N, int Ci, int Hi, int Wi, int Co
 ) {
+    __shared__ float s_tile[2][CONV2_Hi][CONV2_Wi];
+    __shared__ float s_weights[CONV2_Co][CONV2_Ci][CONV2_KENREL_SIZE][CONV2_KENREL_SIZE];
+    __shared__ float s_bias[CONV2_Co];
+    
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const int threads_per_block = blockDim.x * blockDim.y;
+    const int batch = blockIdx.z;
+    
+    // load weights and bias 
+    constexpr int weight_ld4_cnt = (CONV2_Co * CONV2_Ci * CONV2_KENREL_SIZE * CONV2_KENREL_SIZE) / 4;
+    float4* s_weight_base = ((float4*)&s_weights[0][0][0][0]);
+    float4* global_weight_base = ((float4*)w);
+    for (int i = tid; i < weight_ld4_cnt; i += threads_per_block) {
+        s_weight_base[i] = global_weight_base[i];
+    }
+    if (tid < CONV2_Co) {
+        s_bias[tid] = b[tid];
+    }
 
+    // compute pipeline 
+
+    // 1. prologue 
+    constexpr int tile_ld4_cnt = (CONV2_Hi * CONV2_Wi) / 4; // 12*12/4 = 36
+    const float4* global_input_base = (const float4*)(x + (size_t)batch * Ci * Hi * Wi);
+    float4* s_tile_base = (float4*)&s_tile[0][0][0];
+    for (int i = tid; i < tile_ld4_cnt; i += threads_per_block) {
+        s_tile_base[i] = global_input_base[i];
+    }
+    __syncthreads();
+    
+    int out_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int out_y = blockIdx.y * blockDim.y + threadIdx.y;
+    int curr_buf_idx = 1;
+    int next_buf_idx = 0;
+    float acc[CONV2_Co] = {0.f};
+    // 2. pipeline cycle
+    #pragma unroll 1
+    for (int in_c = 0; in_c < CONV2_Ci; ++in_c) {
+        next_buf_idx = curr_buf_idx;
+        curr_buf_idx = curr_buf_idx ^ 1;
+        // prefetch
+        if (in_c < CONV2_Ci - 1) {
+            const float4* global_input_ptr = global_input_base + (size_t)(in_c + 1) * tile_ld4_cnt;
+            float4* s_next_tile_ptr = (float4*)&s_tile[next_buf_idx][0][0];
+            for (int i = tid; i < tile_ld4_cnt; i += threads_per_block) {
+                s_next_tile_ptr[i] = global_input_ptr[i];
+            }
+        }
+        
+        // compute
+        if (out_x < CONV2_Wo && out_y < CONV2_Ho){
+            #pragma unroll
+            for (int ky = 0; ky < CONV2_KENREL_SIZE; ++ky) {
+                #pragma unroll
+                for (int kx = 0; kx < CONV2_KENREL_SIZE; ++kx) {
+                    int in_y = out_y + ky;
+                    int in_x = out_x + kx;
+                    float input_val = s_tile[curr_buf_idx][in_y][in_x];
+                    #pragma unroll
+                    for (int out_c = 0; out_c < CONV2_Co; ++out_c) {
+                        float weight_val = s_weights[out_c][in_c][ky][kx];
+                        acc[out_c] += input_val * weight_val;
+                        // atomicAdd(&y[((size_t)batch * Co + out_c) * CONV2_Ho * CONV2_Wo + out_y * CONV2_Wo + out_x], input_val * weight_val);
+                    }
+                }
+            }
+        }
+        // sync prefetch & compute
+        __syncthreads();
+    }
+    // 3. epologue
+    if (out_x < CONV2_Wo && out_y < CONV2_Ho){
+        size_t y_base_offset = (size_t)batch * Co * CONV2_Ho * CONV2_Wo + out_y * CONV2_Wo + out_x;
+        for (int out_c = 0; out_c < CONV2_Co; ++out_c) {
+            float conv_output = acc[out_c] + s_bias[out_c];
+            size_t y_channel_offset = y_base_offset + (size_t)out_c * CONV2_Ho * CONV2_Wo;
+            y[y_channel_offset] = conv_output;
+        }
+    }
+}
+
+
+
+
+__global__ void conv2d_nchw_fuse_if_native_compress(
+    float* __restrict__ x, // [N, Ci=8, Hi=12, Wi=12]
+    float* __restrict__ w, // [Co=16, Ci=8, K=5, K=5]
+    float* __restrict__ b, // [Co=16]
+    float* __restrict__ y, // [N, Co=16, Ho=8, Wo=8]
+    float* __restrict__ v,
+    int N, int Ci, int Hi, int Wi, int Co
+) {
+    __shared__ float s_tile[2][CONV2_Hi][CONV2_Wi];
+    __shared__ float s_weights[CONV2_Co][CONV2_Ci][CONV2_KENREL_SIZE][CONV2_KENREL_SIZE];
+    __shared__ float s_bias[CONV2_Co];
+    __shared__ float s_v[CONV2_Co][CONV2_Ho][CONV2_Wo];    
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const int threads_per_block = blockDim.x * blockDim.y;
+    const int batch = blockIdx.z;
+    
+    // load weights and bias 
+    constexpr int weight_ld4_cnt = (CONV2_Co * CONV2_Ci * CONV2_KENREL_SIZE * CONV2_KENREL_SIZE) / 4;
+    float4* s_weight_base = ((float4*)&s_weights[0][0][0][0]);
+    float4* global_weight_base = ((float4*)w);
+    for (int i = tid; i < weight_ld4_cnt; i += threads_per_block) {
+        s_weight_base[i] = global_weight_base[i];
+    }
+    float4* s_v_base = ((float4*)&s_v[0][0][0]);
+    float4* global_v_base = ((float4*)v + (size_t)batch * Co * CONV2_Ho * CONV2_Wo / 4);
+    for (int i = tid; i < (CONV2_Co * CONV2_Ho * CONV2_Wo) / 4; i += threads_per_block) {
+        s_v_base[i] = global_v_base[i];
+    }
+    if (tid < CONV2_Co) {
+        s_bias[tid] = b[tid];
+    }
+
+    // compute pipeline 
+
+    // 1. prologue 
+    constexpr int tile_ld4_cnt = (CONV2_Hi * CONV2_Wi) / 4; // 12*12/4 = 36
+    const float4* global_input_base = (const float4*)(x + (size_t)batch * Ci * Hi * Wi);
+    float4* s_tile_base = (float4*)&s_tile[0][0][0];
+    for (int i = tid; i < tile_ld4_cnt; i += threads_per_block) {
+        s_tile_base[i] = global_input_base[i];
+    }
+    __syncthreads();
+    
+    int out_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int out_y = blockIdx.y * blockDim.y + threadIdx.y;
+    int curr_buf_idx = 1;
+    int next_buf_idx = 0;
+    float acc[CONV2_Co] = {0.f};
+    // 2. pipeline cycle
+    #pragma unroll 1
+    for (int in_c = 0; in_c < CONV2_Ci; ++in_c) {
+        next_buf_idx = curr_buf_idx;
+        curr_buf_idx = curr_buf_idx ^ 1;
+        // prefetch
+        if (in_c < CONV2_Ci - 1) {
+            const float4* global_input_ptr = global_input_base + (size_t)(in_c + 1) * tile_ld4_cnt;
+            float4* s_next_tile_ptr = (float4*)&s_tile[next_buf_idx][0][0];
+            for (int i = tid; i < tile_ld4_cnt; i += threads_per_block) {
+                s_next_tile_ptr[i] = global_input_ptr[i];
+            }
+        }
+        
+        // compute
+        if (out_x < CONV2_Wo && out_y < CONV2_Ho){
+            #pragma unroll
+            for (int ky = 0; ky < CONV2_KENREL_SIZE; ++ky) {
+                #pragma unroll
+                for (int kx = 0; kx < CONV2_KENREL_SIZE; ++kx) {
+                    int in_y = out_y + ky;
+                    int in_x = out_x + kx;
+                    float input_val = s_tile[curr_buf_idx][in_y][in_x];
+                    #pragma unroll
+                    for (int out_c = 0; out_c < CONV2_Co; ++out_c) {
+                        float weight_val = s_weights[out_c][in_c][ky][kx];
+                        acc[out_c] += input_val * weight_val;
+                        // atomicAdd(&y[((size_t)batch * Co + out_c) * CONV2_Ho * CONV2_Wo + out_y * CONV2_Wo + out_x], input_val * weight_val);
+                    }
+                }
+            }
+        }
+        // sync prefetch & compute
+        __syncthreads();
+    }
+    // 3. epologue
+    if (out_x < CONV2_Wo && out_y < CONV2_Ho){
+        size_t y_base_offset = (size_t)batch * Co * CONV2_Ho * CONV2_Wo + out_y * CONV2_Wo + out_x;
+        for (int out_c = 0; out_c < CONV2_Co; ++out_c) {
+            float conv_output = acc[out_c] + s_bias[out_c];
+            size_t y_channel_offset = y_base_offset + (size_t)out_c * CONV2_Ho * CONV2_Wo;
+            
+            // float vm = v[y_channel_offset];
+            float vm = s_v[out_c][out_y][out_x];
+            vm += conv_output;
+            float spike = (vm >= 1.0f) ? 1.0f : 0.0f;
+            
+            y[y_channel_offset] = spike;
+            // y[y_channel_offset] = conv_output;
+            v[y_channel_offset] = vm * (1.0f - spike);
+
+        }
+    }
 }
