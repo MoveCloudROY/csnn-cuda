@@ -14,3 +14,5 @@ infer
 *.txt
 
 weight*
+
+*rep
