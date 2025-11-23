@@ -878,8 +878,8 @@ std::vector<int> scnn_inference(
 
             // Conv2: general K=5, grid.z = N only
             {
-                
-                conv2d_nchw_fuse_if<<<grid_c2, block2d, 0, stream >>>(
+                const dim3 block2d_c2(8, 8, 1);
+                conv2d_nchw_fuse_if<<<grid_c2, block2d_c2, 0, stream >>>(
                     d_pool1_out,
                     d_conv2_w,
                     d_conv2_b,
