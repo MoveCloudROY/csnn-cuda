@@ -69,6 +69,15 @@ __global__ void linear_fuse_if(
     int N, int Out, int In
 );
 
+// __global__ void linear_01x_fuse_if(
+//     float* __restrict__ x, // [N, In]
+//     float* __restrict__ w, // [Out, In]
+//     float* __restrict__ b, // [Out]
+//     float* __restrict__ y,       // [N, Out]
+//     float* __restrict__ v,       // [N, Out]
+//     int N, int Out, int In
+// );
+
 
 __global__ void linear_fuse_argmax10(
     float* __restrict__ x, // [N, In]

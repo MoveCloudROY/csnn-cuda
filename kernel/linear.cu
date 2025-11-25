@@ -2,6 +2,7 @@
 #include <cuda_fp16.h>
 #include <cooperative_groups.h>
 #include <mma.h>
+#include <iostream>
 
 using namespace nvcuda;
 
@@ -118,7 +119,7 @@ __global__ void linear_forward(
         );
     }
 
-
+    __syncthreads();
     for (int i = threadIdx.y; i < BM; i += blockDim.y) {
         for (int j = threadIdx.x; j < BN; j += blockDim.x) {
             int c_row = block_m + i;
@@ -140,6 +141,7 @@ __global__ void linear_fuse_if(
     float*       v, // [N, Out]
     int M, int N, int K
 ) {
+
     const int BM      = MATMUL4_BLOCK_M;
     const int BN      = MATMUL4_BLOCK_N;
     const int BK      = MATMUL4_BLOCK_K;
@@ -241,18 +243,20 @@ __global__ void linear_fuse_if(
             wmma::mem_row_major
         );
     }
+    __syncthreads();
     // store y fragments to y
     int threadid = (threadIdx.y * blockDim.x + threadIdx.x);
     #pragma unroll
-    for (int i = 0; i < BM * BN / 4; i += blockDim.x * blockDim.y ) {
-        int index = threadid + i;
+    for (int i = threadid; i < BM * BN / 4; i += blockDim.x * blockDim.y ) {
+        int index = i;
         int c_row = (index * 4) / BN;
         int c_col = (index * 4) % BN;
         int gc_row = block_m + c_row;
         int gc_col = block_n + c_col;
-        float4 b4 = FETCH_FLOAT4(b[gc_col]);
-        float4 v4 = FETCH_FLOAT4(v[gc_row * N + gc_col]);
+        // printf("threadid=%d, i=%d, c_row=%d, c_col=%d, gc_row=%d, gc_col=%d\n", threadid, i, c_row, c_col, gc_row, gc_col);
         if (gc_row < M && gc_col + 3 < N) {
+            float4 b4 = FETCH_FLOAT4(b[gc_col]);
+            float4 v4 = FETCH_FLOAT4(v[gc_row * N + gc_col]);
             v4.x += __half2float(Cs[c_row * BN + c_col]) + b4.x;
             v4.y += __half2float(Cs[c_row * BN + c_col + 1]) + b4.y;
             v4.z += __half2float(Cs[c_row * BN + c_col + 2]) + b4.z;
@@ -266,30 +270,39 @@ __global__ void linear_fuse_if(
             v4.y *= (1. - s.y);
             v4.z *= (1. - s.z);
             v4.w *= (1. - s.w);
-            FETCH_FLOAT4(v[gc_row * N + gc_col]) = s;
+            // FETCH_FLOAT4(v[gc_row * N + gc_col]) = s;
+            float4* addr_v = (float4 *)&v[gc_row * N + gc_col];
+            addr_v[0] = v4;
+            // v[gc_row * N + gc_col] = v4.x;
+            // v[gc_row * N + gc_col + 1] = v4.y;
+            // v[gc_row * N + gc_col + 2] = v4.z;
+            // v[gc_row * N + gc_col + 3] = v4.w;
 
             // float4 tmp = {__half2float(,
             //             __half2float(Cs[c_row * BN + c_col + 1]) + b4.y,
             //             __half2float(Cs[c_row * BN + c_col + 2]) + b4.z,
             //             __half2float(Cs[c_row * BN + c_col + 3]) + b4.w};
-            FETCH_FLOAT4(y[(gc_row) * N + gc_col]) = s;
+            float4 * addr_y = (float4 *)&y[gc_row * N + gc_col];
+            addr_y[0] = s;
+            // FETCH_FLOAT4(y[(gc_row) * N + gc_col]) = s;
+            // y[gc_row * N + gc_col] = s.x;
+            // y[gc_row * N + gc_col + 1] = s.y;
+            // y[gc_row * N + gc_col + 2] = s.z;
+            // y[gc_row * N + gc_col + 3] = s.w;
+
         }
     }
-// #pragma unroll
-//     for (int i = threadIdx.y; i < BM; i += blockDim.y) {
-//         for (int j = threadIdx.x; j < BN; j += blockDim.x) {
-//             int c_row = block_m + i;
-//             int c_col = block_n + j;
-//             if (c_row < M && c_col < N) {
-//                 // Cs[i * BN + j]       = Cs[i * BN + j] + __float2half(b[c_col]);
-//                 float vv = v[c_row * N + c_col] + __half2float(Cs[i * BN + j]) + b[c_col];
-//                 int   f  = vv >= 1.0f;
-//                 y[c_row * N + c_col] = f;
-//                 v[c_row * N + c_col] = f ? 0 : vv;
-//             }
-//         }
-//     }
+
 }
+
+__global__ void linear_01x_fuse_if(
+    float* __restrict__ x, // [N, In]
+    float* __restrict__ w, // [Out, In]
+    float* __restrict__ b, // [Out]
+    float* __restrict__ y,       // [N, Out]
+    float* __restrict__ v,       // [N, Out]
+    int N, int Out, int In
+);
 
 
 __global__ void linear_fuse_argmax10(
@@ -392,9 +405,7 @@ __global__ void linear_fuse_argmax10(
             wmma::mem_row_major
         );
     }
-#pragma unroll
-
-
+// #pragma unroll
     // for (int i = threadIdx.y; i < BM; i += blockDim.y) {
     //     for (int j = threadIdx.x; j < BN; j += blockDim.x) {
     //         int c_row = block_m + i;
