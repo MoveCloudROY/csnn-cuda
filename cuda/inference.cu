@@ -353,65 +353,6 @@ __global__ void conv2d_c1_k5_fuse_if_kernel(
 }
 
 
-// __global__ void conv2d_c1_k5_fuse_if_kernel(
-//     const float* __restrict__ x, // [N, 1, 28, 28]
-//     const float* __restrict__ w, // [Co, 1, 5, 5]
-//     const float* __restrict__ b, // [Co]
-//     float* __restrict__ y,       // [N, Co, 24, 24]
-//     float* __restrict__ v,
-//     int N, int Co
-// ) {
-//     constexpr int           K  = 5;
-//     const int               Hi = 28, Wi = 28;
-//     const int               Ho = 24, Wo = 24;
-//     extern __shared__ float tile[];
-//     const int               tileW = blockDim.x + K - 1;
-//     const int               tileH = blockDim.y + K - 1;
-//     const int               tx    = threadIdx.x;
-//     const int               ty    = threadIdx.y;
-//     const int               ow    = blockIdx.x * blockDim.x + tx;
-//     const int               oh    = blockIdx.y * blockDim.y + ty;
-//     const int               z     = blockIdx.z;
-//     const int               oc    = z % Co;
-//     const int               n     = z / Co;
-//     if (n >= N)
-//         return;
-//     const int ow0 = blockIdx.x * blockDim.x;
-//     const int oh0 = blockIdx.y * blockDim.y;
-//     for (int yy = ty; yy < tileH; yy += blockDim.y) {
-//         int ih = oh0 + yy;
-//         for (int xx = tx; xx < tileW; xx += blockDim.x) {
-//             int   iw = ow0 + xx;
-//             float v  = 0.0f;
-//             if (ih >= 0 && ih < Hi && iw >= 0 && iw < Wi) {
-//                 const int x_idx = ((n * 1 + 0) * Hi + ih) * Wi + iw;
-//                 v               = __ldg(x + x_idx);
-//             }
-//             tile[yy * tileW + xx] = v;
-//         }
-//     }
-//     __syncthreads();
-//     if (oh < Ho && ow < Wo) {
-//         const float* w_oc = w + oc * (K * K);
-//         float        acc  = __ldg(b + oc);
-// #pragma unroll
-//         for (int ky = 0; ky < K; ++ky) {
-// #pragma unroll
-//             for (int kx = 0; kx < K; ++kx) {
-//                 float xv = tile[(ty + ky) * tileW + (tx + kx)];
-//                 float ww = __ldg(w_oc + ky * K + kx);
-//                 acc      = fmaf(xv, ww, acc);
-//             }
-//         }
-//         const int y_idx = ((n * Co + oc) * Ho + oh) * Wo + ow;
-//         float vm = v[y_idx] + acc;
-//         float spike = (vm >= 1.0f) ? 1.0f : 0.0f;
-//         y[y_idx]        = spike;
-//         v[y_idx] = vm * (1 - spike);
-//     }
-// }
-
-
 __global__ void maxpool2x2_s2_nchw_kernel(
     const float* __restrict__ x, // [N, C, Hi, Wi]
     float* __restrict__ y,       // [N, C, Ho, Wo]
