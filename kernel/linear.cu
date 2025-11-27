@@ -296,13 +296,77 @@ __global__ void linear_fuse_if(
 }
 
 __global__ void linear_01x_fuse_if(
-    float* __restrict__ x, // [N, In]
-    float* __restrict__ w, // [Out, In]
-    float* __restrict__ b, // [Out]
+    const float* __restrict__ x, // [N, In], 0/1
+    const float* __restrict__ w, // [Out, In] in logical shape, ROW-major in memory
+    const float* __restrict__ b, // [Out]
     float* __restrict__ y,       // [N, Out]
     float* __restrict__ v,       // [N, Out]
     int N, int Out, int In
-);
+)
+{
+    // 优化版：针对 0/1 脉冲输入
+    // - 使用 shared memory 缓存 x[n, :] (所有线程共享)
+    // - 每个线程处理一个输出神经元，直接从 global memory 以 float4 读取权重
+    // - 显式向量化加载和计算
+
+    int n = blockIdx.y; // batch 样本索引
+    if (n >= N) return;
+
+    int o = blockIdx.x * blockDim.x + threadIdx.x; // 输出神经元索引
+    if (o >= Out) return;
+
+    const int VEC = 4; // float4 向量化
+
+    // Shared memory 只缓存 x 行
+    extern __shared__ float x_s[];
+
+    const float* x_row = x + n * In;    // x[n, :]
+    const float* w_row = w + o * In;    // W[o, :] 权重行
+
+    // 1) 协作加载 x[n, :] 到 shared memory (float4 方式)
+    int In4_aligned = (In / VEC) * VEC;
+    for (int k = threadIdx.x * VEC; k < In4_aligned; k += blockDim.x * VEC) {
+        if (k + VEC <= In) {
+            float4 v4 = *reinterpret_cast<const float4*>(&x_row[k]);
+            *reinterpret_cast<float4*>(&x_s[k]) = v4;
+        }
+    }
+    // 处理非对齐尾部
+    for (int k = In4_aligned + threadIdx.x; k < In; k += blockDim.x) {
+        x_s[k] = x_row[k];
+    }
+
+    __syncthreads();
+
+    // 2) 每个线程独立计算自己的输出神经元
+    float acc = 0.0f;
+
+    // 向量化累加：从 global memory 读取权重，从 shared memory 读取输入
+    #pragma unroll 8
+    for (int k = 0; k < In4_aligned; k += VEC) {
+        float4 xv4 = *reinterpret_cast<float4*>(&x_s[k]);
+        float4 wv4 = *reinterpret_cast<const float4*>(&w_row[k]);
+        
+        acc = fmaf(xv4.x, wv4.x, acc);
+        acc = fmaf(xv4.y, wv4.y, acc);
+        acc = fmaf(xv4.z, wv4.z, acc);
+        acc = fmaf(xv4.w, wv4.w, acc);
+    }
+
+    // 处理尾部（非 4 对齐部分）
+    for (int k = In4_aligned; k < In; ++k) {
+        acc = fmaf(x_s[k], w_row[k], acc);
+    }
+
+    acc += b[o];
+
+    // IF 节点：整合并触发脉冲
+    int idx = n * Out + o;
+    float vm = v[idx] + acc;
+    float spike = (vm >= 1.0f) ? 1.0f : 0.0f;
+    y[idx] = spike;
+    v[idx] = vm * (1.0f - spike);
+}
 
 
 __global__ void linear_fuse_argmax10(

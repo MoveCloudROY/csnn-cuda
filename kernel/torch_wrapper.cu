@@ -387,6 +387,43 @@ void linear_fuse_if_forward(
     TORCH_CHECK(err == cudaSuccess, "fc kernel failed: ", cudaGetErrorString(err));
 }
 
+void linear_01x_fuse_if_forward(
+    torch::Tensor x, torch::Tensor W, torch::Tensor b, torch::Tensor y, torch::Tensor v
+) {
+    TORCH_CHECK(x.is_cuda() && W.is_cuda() && b.is_cuda() && y.is_cuda(), "CUDA tensors req");
+    TORCH_CHECK(
+        x.dtype() == torch::kFloat32 && W.dtype() == torch::kFloat32 &&
+            b.dtype() == torch::kFloat32 && y.dtype() == torch::kFloat32,
+        "float32 only"
+    );
+    const int N = x.size(0), In = x.size(1), Out = W.size(0);
+
+    // 优化的 block/grid 配置：
+    // - 对于 Out=96, 使用 blockDim.x=128 更合适（避免浪费）
+    // - 对于 Out=512, blockDim.x=256 更好
+    // - gridDim.y=N 让每个 block 处理一个样本的部分输出
+    const int threads = (Out <= 128) ? 128 : 256;
+    dim3 blockDim(threads, 1, 1);
+    dim3 gridDim(div_up(Out, threads), N, 1);
+    
+    // Shared memory 大小：只需缓存一个 x 行 (In floats)
+    const int smem_size = In * sizeof(float);
+    
+    linear_01x_fuse_if<<<gridDim, blockDim, smem_size>>>(
+        x.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b.data_ptr<float>(),
+        y.data_ptr<float>(),
+        v.data_ptr<float>(),
+        N,
+        Out,
+        In
+    );
+    auto err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "linear_01x_fuse_if kernel failed: ", cudaGetErrorString(err));
+}
+
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("conv1", &conv1, "conv1");
@@ -403,4 +440,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fc_forward", &fc_forward, "FC forward");
     m.def("linear", &linear, "Linear forward");
     m.def("linear_fuse_if_forward", &linear_fuse_if_forward, "Linear forward with if fusion");
+    m.def("linear_01x_fuse_if_forward", &linear_01x_fuse_if_forward, "Linear 01x forward with if fusion");
 }

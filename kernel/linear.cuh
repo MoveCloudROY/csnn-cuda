@@ -88,5 +88,12 @@ __global__ void linear_fuse_argmax10(
     int N, int Out, int In
 );
 // __global__ __launch_bounds__(1024) void linear_fuse_if(
-//     int M, int N, int K, half alpha, half* A, half* B, half beta, half* C
-// );
+// x is assumed to be 0/1 spikes; optimized for V100, batch 512~1024
+__global__ void linear_01x_fuse_if(
+     const float* __restrict__ x, // [N, In], 0/1
+     const float* __restrict__ w, // [Out, In]
+     const float* __restrict__ b, // [Out]
+     float* __restrict__ y,       // [N, Out]
+     float* __restrict__ v,       // [N, Out]
+     int N, int Out, int In
+);
