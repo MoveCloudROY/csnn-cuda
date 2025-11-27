@@ -877,7 +877,6 @@ struct Global {
     
     cudaStream_t stream[STREAM_N];
 
-
 private:
     Global() {
         // Pre-allocate device buffers for the maximum batch size to reuse across batches
@@ -888,6 +887,144 @@ private:
             checkCudaErrors(cudaMallocHost(&h_batch[i], sizeof(float) * MAX_N * C1_IN * I_H * I_W));
             checkCudaErrors(cudaMallocHost(&h_batch_preds[i], sizeof(int) * MAX_N));
         }
+
+        // Warmup: allocate temporary dummy weights and execute kernels once
+        // to avoid cold-start overhead during actual inference
+        warmup_kernels();
+    }
+
+    void warmup_kernels() {
+        // Allocate temporary dummy weights (all zeros for warmup)
+        float *d_conv1_w, *d_conv1_b, *d_conv2_w, *d_conv2_b;
+        float *d_fc1_w, *d_fc1_b, *d_fc2_w, *d_fc2_b, *d_fc3_w, *d_fc3_b;
+        
+        // Conv1: [C1_OUT=8, C1_IN=1, K=5, K=5]
+        checkCudaErrors(cudaMalloc(&d_conv1_w, C1_OUT * C1_IN * K * K * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_conv1_b, C1_OUT * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_conv1_w, 0, C1_OUT * C1_IN * K * K * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_conv1_b, 0, C1_OUT * sizeof(float)));
+        
+        // Conv2: [C2_OUT=16, C2_IN=8, K=5, K=5]
+        checkCudaErrors(cudaMalloc(&d_conv2_w, C2_OUT * C2_IN * K * K * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_conv2_b, C2_OUT * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_conv2_w, 0, C2_OUT * C2_IN * K * K * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_conv2_b, 0, C2_OUT * sizeof(float)));
+        
+        // FC1: [FC1_O=128, FLAT=256]
+        checkCudaErrors(cudaMalloc(&d_fc1_w, FC1_O * FLAT * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_fc1_b, FC1_O * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_fc1_w, 0, FC1_O * FLAT * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_fc1_b, 0, FC1_O * sizeof(float)));
+        
+        // FC2: [FC2_O=96, FC1_O=128]
+        checkCudaErrors(cudaMalloc(&d_fc2_w, FC2_O * FC1_O * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_fc2_b, FC2_O * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_fc2_w, 0, FC2_O * FC1_O * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_fc2_b, 0, FC2_O * sizeof(float)));
+        
+        // FC3: [FC3_O=10, FC2_O=96]
+        checkCudaErrors(cudaMalloc(&d_fc3_w, FC3_O * FC2_O * sizeof(float)));
+        checkCudaErrors(cudaMalloc(&d_fc3_b, FC3_O * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_fc3_w, 0, FC3_O * FC2_O * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_fc3_b, 0, FC3_O * sizeof(float)));
+
+        // Use first stream for warmup with minimal batch size
+        constexpr int warmup_N = 512;
+        auto& warmup_stream = stream[0];
+        
+        float* d_input = d_workspace[0] + d_input_offset;
+        float* d_conv1_out = d_workspace[0] + d_conv1_out_offset;
+        float* d_if1_mem = d_workspace[0] + d_if1_mem_offset;
+        float* d_pool1_out = d_workspace[0] + d_pool1_out_offset;
+        float* d_conv2_out = d_workspace[0] + d_conv2_out_offset;
+        float* d_if2_mem = d_workspace[0] + d_if2_mem_offset;
+        float* d_pool2_out = d_workspace[0] + d_pool2_out_offset;
+        float* d_fc1_out = d_workspace[0] + d_fc1_out_offset;
+        float* d_if3_mem = d_workspace[0] + d_if3_mem_offset;
+        float* d_fc2_out = d_workspace[0] + d_fc2_out_offset;
+        float* d_if4_mem = d_workspace[0] + d_if4_mem_offset;
+        float* d_fc3_out = d_workspace[0] + d_fc3_out_offset;
+        float* d_logits_sum = d_workspace[0] + d_logits_sum_offset;
+        int* d_preds = (int*)(d_workspace[0] + d_preds_offset);
+
+        // Zero input and intermediate memories
+        checkCudaErrors(cudaMemsetAsync(d_input, 0, warmup_N * C1_IN * I_H * I_W * sizeof(float), warmup_stream));
+        checkCudaErrors(cudaMemsetAsync(d_if1_mem, 0, warmup_N * C1_OUT * C1_HO * C1_WO * sizeof(float), warmup_stream));
+        checkCudaErrors(cudaMemsetAsync(d_if2_mem, 0, warmup_N * C2_OUT * C2_HO * C2_WO * sizeof(float), warmup_stream));
+        checkCudaErrors(cudaMemsetAsync(d_if3_mem, 0, warmup_N * FC1_O * sizeof(float), warmup_stream));
+        checkCudaErrors(cudaMemsetAsync(d_if4_mem, 0, warmup_N * FC2_O * sizeof(float), warmup_stream));
+        checkCudaErrors(cudaMemsetAsync(d_logits_sum, 0, warmup_N * FC3_O * sizeof(float), warmup_stream));
+
+        // Launch configs
+        const dim3 block2d(16, 16, 1);
+        const size_t conv1_smem = (block2d.x + K - 1) * (block2d.y + K - 1) * sizeof(float);
+        const dim3 grid_c1(div_up(C1_WO, block2d.x), div_up(C1_HO, block2d.y), warmup_N * C1_OUT);
+        const dim3 grid_c2(div_up(C2_WO, block2d.x), div_up(C2_HO, block2d.y), warmup_N);
+        const dim3 grid_pool1(div_up(P1_WO, block2d.x), div_up(P1_HO, block2d.y), warmup_N * C1_OUT);
+        const dim3 grid_pool2(div_up(P2_WO, block2d.x), div_up(P2_HO, block2d.y), warmup_N * C2_OUT);
+        const int threads1d = 256;
+
+        // Execute 32 complete iterations to thoroughly warmup all kernels
+        constexpr int warmup_iterations = 64;
+        for (int iter = 0; iter < warmup_iterations; ++iter) {
+            conv2d_c1_k5_fuse_if_kernel<<<grid_c1, block2d, conv1_smem, warmup_stream>>>(
+                d_input, d_conv1_w, d_conv1_b, d_conv1_out, d_if1_mem, warmup_N, C1_OUT
+            );
+            
+            maxpool2x2_s2_nchw_kernel<<<grid_pool1, block2d, 0, warmup_stream>>>(
+                d_conv1_out, d_pool1_out, warmup_N, C1_OUT, C1_HO, C1_WO
+            );
+            
+            const dim3 block2d_c2(8, 8, 1);
+            conv2d_nchw_fuse_if<<<grid_c2, block2d_c2, 0, warmup_stream>>>(
+                d_pool1_out, d_conv2_w, d_conv2_b, d_conv2_out, d_if2_mem,
+                warmup_N, C2_IN, P1_HO, P1_WO, C2_OUT
+            );
+            
+            maxpool2x2_s2_nchw_kernel<<<grid_pool2, block2d, 0, warmup_stream>>>(
+                d_conv2_out, d_pool2_out, warmup_N, C2_OUT, C2_HO, C2_WO
+            );
+            
+            dim3 fc_blockDim(MATMUL_THREAD_M, MATMUL_THREAD_N);
+            dim3 fc1_gridDim(div_up(warmup_N, MATMUL_BLOCK_M), div_up(FC1_O, MATMUL_BLOCK_N));
+            linear_fuse_if<<<fc1_gridDim, fc_blockDim, 0, warmup_stream>>>(
+                d_pool2_out, d_fc1_w, d_fc1_b, d_fc1_out, d_if3_mem, warmup_N, FC1_O, FLAT
+            );
+            
+            dim3 fc2_gridDim(div_up(warmup_N, MATMUL_BLOCK_M), div_up(FC2_O, MATMUL_BLOCK_N));
+            linear_fuse_if<<<fc2_gridDim, fc_blockDim, 0, warmup_stream>>>(
+                d_fc1_out, d_fc2_w, d_fc2_b, d_fc2_out, d_if4_mem, warmup_N, FC2_O, FC1_O
+            );
+            
+            dim3 fc3_gridDim(div_up(warmup_N, MATMUL_BLOCK_M), div_up(FC3_O, MATMUL_BLOCK_N));
+            linear_forward<<<fc3_gridDim, fc_blockDim, 0, warmup_stream>>>(
+                d_fc2_out, d_fc3_w, d_fc3_b, d_fc3_out, warmup_N, FC3_O, FC2_O
+            );
+            
+            int total = warmup_N * FC3_O;
+            int blocks = div_up(total, threads1d);
+            add_inplace_kernel<<<blocks, threads1d, 0, warmup_stream>>>(d_logits_sum, d_fc3_out, total);
+            scale_inplace_kernel<<<blocks, threads1d, 0, warmup_stream>>>(d_logits_sum, 1.0f / float(TT), total);
+            
+            const int argmax_threads = 256;
+            const int argmax_blocks = div_up(warmup_N, argmax_threads);
+            argmax10_kernel<<<argmax_blocks, argmax_threads, 0, warmup_stream>>>(d_logits_sum, d_preds, warmup_N);
+        }
+        
+        // Wait for warmup to complete
+        checkCudaErrors(cudaStreamSynchronize(warmup_stream));
+
+        // Free temporary warmup weights
+        checkCudaErrors(cudaFree(d_conv1_w));
+        checkCudaErrors(cudaFree(d_conv1_b));
+        checkCudaErrors(cudaFree(d_conv2_w));
+        checkCudaErrors(cudaFree(d_conv2_b));
+        checkCudaErrors(cudaFree(d_fc1_w));
+        checkCudaErrors(cudaFree(d_fc1_b));
+        checkCudaErrors(cudaFree(d_fc2_w));
+        checkCudaErrors(cudaFree(d_fc2_b));
+        checkCudaErrors(cudaFree(d_fc3_w));
+        checkCudaErrors(cudaFree(d_fc3_b));
     }
 };
 
