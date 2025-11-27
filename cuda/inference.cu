@@ -746,14 +746,14 @@ __global__ void add_inplace_kernel(float* __restrict__ a, const float* __restric
     a[i] += b[i];
 }
 
-__global__ void scale_inplace_kernel(float* __restrict__ a, float s, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n)
-        return;
-    a[i] *= s;
-}
+// __global__ void scale_inplace_kernel(float* __restrict__ a, float s, int n) {
+//     int i = blockIdx.x * blockDim.x + threadIdx.x;
+//     if (i >= n)
+//         return;
+//     a[i] *= s;
+// }
 
-__global__ void scale_inplace_ptx(float* a, float s, int n) {
+__global__ void scale_inplace_kernel(float* a, float s, int n) {
     // 计算线程索引: i = blockIdx.x * blockDim.x + threadIdx.x
     int i;
     asm volatile(
