@@ -707,6 +707,42 @@ __global__ void scale_inplace_kernel(float* __restrict__ a, float s, int n) {
     a[i] *= s;
 }
 
+__global__ void scale_inplace_ptx(float* a, float s, int n) {
+    // 计算线程索引: i = blockIdx.x * blockDim.x + threadIdx.x
+    int i;
+    asm volatile(
+        "{\n\t"
+        ".reg .u32 t1, t2;\n\t"
+        "mov.u32 t1, %%ctaid.x;\n\t"      // t1 = blockIdx.x
+        "mov.u32 t2, %%ntid.x;\n\t"       // t2 = blockDim.x
+        "mul.lo.u32 t1, t1, t2;\n\t"      // t1 = blockIdx.x * blockDim.x
+        "mov.u32 t2, %%tid.x;\n\t"        // t2 = threadIdx.x
+        "add.u32 %0, t1, t2;\n\t"         // i = t1 + t2
+        "}\n\t"
+        : "=r"(i)
+    );
+
+    // 边界检查: if (i >= n) return;
+    if (i >= n)
+        return;
+
+    // 加载、乘法、存储 使用 PTX
+    float val;
+    unsigned long long addr;
+    asm volatile(
+        "{\n\t"
+        "mul.wide.s32 %0, %2, 4;\n\t"         // offset = i * 4 (64-bit result)
+        "add.u64 %0, %0, %3;\n\t"             // addr = a + offset
+        "ld.global.f32 %1, [%0];\n\t"         // val = *addr
+        "mul.f32 %1, %1, %4;\n\t"             // val = val * s
+        "st.global.f32 [%0], %1;\n\t"         // *addr = val
+        "}\n\t"
+        : "=l"(addr), "=f"(val)
+        : "r"(i), "l"((unsigned long long)a), "f"(s)
+        : "memory"
+    );
+}
+
 __global__ void argmax10_kernel(const float* __restrict__ logits, int* __restrict__ preds, int N) {
     int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n >= N)
