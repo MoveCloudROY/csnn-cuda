@@ -87,6 +87,8 @@ std::vector<float> read_param(const std::string& path) {
 // ===================================================================================
 
 
+
+
 // clang-format off
 #define BATCH_SIZE          512
 #define STREAM_N            ((10000 + BATCH_SIZE - 1) / BATCH_SIZE)
@@ -351,6 +353,7 @@ __global__ void conv2d_c1_k5_fuse_if_kernel(
         v[y_idx] = vm * (1 - spike);
     }
 }
+
 
 
 __global__ void maxpool2x2_s2_nchw_kernel(
@@ -746,12 +749,6 @@ __global__ void add_inplace_kernel(float* __restrict__ a, const float* __restric
     a[i] += b[i];
 }
 
-// __global__ void scale_inplace_kernel(float* __restrict__ a, float s, int n) {
-//     int i = blockIdx.x * blockDim.x + threadIdx.x;
-//     if (i >= n)
-//         return;
-//     a[i] *= s;
-// }
 
 __global__ void scale_inplace_kernel(float* a, float s, int n) {
     // 计算线程索引: i = blockIdx.x * blockDim.x + threadIdx.x
@@ -789,6 +786,7 @@ __global__ void scale_inplace_kernel(float* a, float s, int n) {
     );
 }
 
+
 __global__ void argmax10_kernel(const float* __restrict__ logits, int* __restrict__ preds, int N) {
     int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n >= N)
@@ -805,6 +803,7 @@ __global__ void argmax10_kernel(const float* __restrict__ logits, int* __restric
     }
     preds[n] = best_k;
 }
+
 
 struct Global {
     static Global& Get()
@@ -965,7 +964,7 @@ private:
         const int threads1d = 256;
 
         // Execute 32 complete iterations to thoroughly warmup all kernels
-        constexpr int warmup_iterations = 64;
+        constexpr int warmup_iterations = 512;
         for (int iter = 0; iter < warmup_iterations; ++iter) {
             conv2d_c1_k5_fuse_if_kernel<<<grid_c1, block2d, conv1_smem, warmup_stream>>>(
                 d_input, d_conv1_w, d_conv1_b, d_conv1_out, d_if1_mem, warmup_N, C1_OUT
